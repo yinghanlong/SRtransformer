@@ -290,7 +290,7 @@ class GPT2MLP-Spiking(nn.Module):
             return hidden_states
         else: #during inference, only activate the weights related to the current timestep
             x = hidden_states[:,t,:]
-            x = x.view(-1, x.size(-1)) # x size: [batch, channel]
+            x = x.view(-1, x.size(-1)) # x size: [batch, 1, channel]
             x = self.c_fc(x)
             x = self.act(x)
             x = self.c_proj(x)

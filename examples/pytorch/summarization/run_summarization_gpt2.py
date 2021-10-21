@@ -224,6 +224,7 @@ def parse_args():
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
+    parser.add_argument("--num_layers", type=int, default=12, help="Total number of hidden layers in transformer.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -357,9 +358,14 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
-
+    #Yinghan: change number of layers
+    config.num_hidden_layers = args.num_layers
     if args.model_name_or_path:
-        model = AutoModelForSeq2SeqLM.from_pretrained(
+        if args.model_name_or_path=='gpt2':
+            logger.info("---------------Training GPT2------------")
+            model = GPT2LMHeadModel.from_pretrained('gpt2')
+        else:
+        model =  AutoModelForSeq2SeqLM.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
@@ -435,6 +441,8 @@ def main():
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 1):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+        logger.info(f"attention mask {index} of the training set: {train_dataset[index]['attention_mask'].shape}.")
+        
 
     label_pad_token_id = -100 if args.ignore_pad_token_for_loss else tokenizer.pad_token_id
     data_collator = DataCollatorForSeq2Seq(
