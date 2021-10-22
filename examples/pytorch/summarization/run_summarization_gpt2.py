@@ -46,6 +46,7 @@ from transformers import (
     SchedulerType,
     get_scheduler,
     set_seed,
+    GPT2LMHeadModel
 )
 from transformers.file_utils import is_offline_mode
 from transformers.utils.versions import require_version
@@ -353,6 +354,8 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+        if (args.model_name_or_path=='gpt2'):
+            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
@@ -365,18 +368,19 @@ def main():
             logger.info("---------------Training GPT2------------")
             model = GPT2LMHeadModel.from_pretrained('gpt2')
         else:
-        model =  AutoModelForSeq2SeqLM.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-        )
+            model =  AutoModelForSeq2SeqLM.from_pretrained(
+                args.model_name_or_path,
+                from_tf=bool(".ckpt" in args.model_name_or_path),
+                config=config,
+            )
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForSeq2SeqLM.from_config(config)
 
     model.resize_token_embeddings(len(tokenizer))
     if model.config.decoder_start_token_id is None:
-        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+        model.config.decoder_start_token_id=0
+        #raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
 
     prefix = args.source_prefix if args.source_prefix is not None else ""
 
@@ -441,7 +445,7 @@ def main():
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 1):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-        logger.info(f"attention mask {index} of the training set: {train_dataset[index]['attention_mask'].shape}.")
+        logger.info(f"attention mask {index} size of the training set: {len(train_dataset[index]['attention_mask'])}.")
         
 
     label_pad_token_id = -100 if args.ignore_pad_token_for_loss else tokenizer.pad_token_id
@@ -524,6 +528,7 @@ def main():
     for epoch in range(args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
+            logger.info(f"  Input size = {batch['input_ids'].shape}, label size = {batch['labels'].shape}")
             outputs = model(**batch)
             loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
