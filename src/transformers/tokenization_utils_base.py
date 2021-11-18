@@ -1662,7 +1662,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
             }
             # Look for the tokenizer files
             for file_id, file_name in {**cls.vocab_files_names, **additional_files_names}.items():
-                if os.path.isdir(pretrained_model_name_or_path):
+                if os.path.isdir(pretrained_model_name_or_path): #TODO:enable
                     if subfolder is not None:
                         full_file_name = os.path.join(pretrained_model_name_or_path, subfolder, file_name)
                     else:
@@ -1678,6 +1678,13 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
                         revision=revision,
                         mirror=None,
                     )
+                full_file_name = hf_bucket_url(
+                    pretrained_model_name_or_path,
+                    filename=file_name,
+                    subfolder=subfolder,
+                    revision=revision,
+                    mirror=None,
+                ) 
 
                 vocab_files[file_id] = full_file_name
 

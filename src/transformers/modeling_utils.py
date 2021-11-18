@@ -1205,7 +1205,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         # Load model
         if pretrained_model_name_or_path is not None:
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
-            if os.path.isdir(pretrained_model_name_or_path):
+            if 1==0:#os.path.isdir(pretrained_model_name_or_path): #TODO:enable
                 if from_tf and os.path.isfile(os.path.join(pretrained_model_name_or_path, TF_WEIGHTS_NAME + ".index")):
                     # Load from a TF 1.0 checkpoint in priority if from_tf
                     archive_file = os.path.join(pretrained_model_name_or_path, TF_WEIGHTS_NAME + ".index")

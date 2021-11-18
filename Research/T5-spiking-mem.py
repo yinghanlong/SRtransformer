@@ -287,8 +287,8 @@ class T5DenseReluDenseSpiking(nn.Module):
         self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, hidden_states, train=True, t=0):
-        if train:
+    def forward(self, hidden_states,  t=0):
+        if self.training:
             hidden_states = self.wi(hidden_states)
             hidden_states = nn.functional.relu(hidden_states)
             hidden_states = self.dropout(hidden_states)
@@ -312,8 +312,8 @@ class T5DenseGatedGeluDenseSpiking(nn.Module):
         self.dropout = nn.Dropout(config.dropout_rate)
         self.gelu_act = ACT2FN["gelu_new"]
 
-    def forward(self, hidden_states,train=True, t=0):
-        if train:
+    def forward(self, hidden_states, t=0):
+        if self.training:
             hidden_gelu = self.gelu_act(self.wi_0(hidden_states))
             hidden_linear = self.wi_1(hidden_states)
             hidden_states = hidden_gelu * hidden_linear
@@ -914,6 +914,7 @@ class T5Stack(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        t=0
     ):
         # Model parallel
         if self.model_parallel:

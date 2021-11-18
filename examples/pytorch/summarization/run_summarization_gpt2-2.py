@@ -31,7 +31,6 @@ import torch
 from datasets import load_dataset, load_metric
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from datetime import datetime
 
 import transformers
 from accelerate import Accelerator
@@ -47,11 +46,12 @@ from transformers import (
     SchedulerType,
     get_scheduler,
     set_seed,
+    GPT2LMHeadModel
 )
 from transformers.file_utils import is_offline_mode
 from transformers.utils.versions import require_version
 
-date= datetime.now().strftime('%Y-%m-%d')
+
 logger = logging.getLogger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
 
@@ -109,12 +109,6 @@ def parse_args():
         type=bool,
         default=True,
         help="Whether to ignore the tokens corresponding to " "padded labels in the loss computation or not.",
-    )
-    parser.add_argument(
-        "--evaluation_only",
-        type=bool,
-        default=False,
-        help="Do not train the model, only evaluate",
     )
     parser.add_argument(
         "--max_source_length",
@@ -189,12 +183,6 @@ def parse_args():
         help="Pretrained config name or path if not the same as model_name",
     )
     parser.add_argument(
-        "--gpu",
-        type=str,
-        default='0',
-        help="select gpu",
-    )
-    parser.add_argument(
         "--tokenizer_name",
         type=str,
         default=None,
@@ -237,6 +225,7 @@ def parse_args():
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
+    parser.add_argument("--num_layers", type=int, default=12, help="Total number of hidden layers in transformer.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -311,9 +300,6 @@ def main():
         level=logging.INFO,
     )
     logger.info(accelerator.state)
-    logger.info(accelerator.device)
-    #select gpu device
-    device= torch.device('cuda:'+args.gpu)  
 
     # Setup logging, we only want one process per machine to log things on the screen.
     # accelerator.is_local_main_process is only True for one process per machine.
@@ -366,29 +352,35 @@ def main():
 
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
-    elif args.config_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.config_name, use_fast=not args.use_slow_tokenizer)
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+        if (args.model_name_or_path=='gpt2'):
+            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
-
+    #Yinghan: change number of layers
+    config.num_hidden_layers = args.num_layers
     if args.model_name_or_path:
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-        )
+        if args.model_name_or_path=='gpt2':
+            logger.info("---------------Training GPT2------------")
+            model = GPT2LMHeadModel.from_pretrained('gpt2')
+        else:
+            model =  AutoModelForSeq2SeqLM.from_pretrained(
+                args.model_name_or_path,
+                from_tf=bool(".ckpt" in args.model_name_or_path),
+                config=config,
+            )
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForSeq2SeqLM.from_config(config)
 
     model.resize_token_embeddings(len(tokenizer))
     if model.config.decoder_start_token_id is None:
-        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+        model.config.decoder_start_token_id=0
+        #raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
 
     prefix = args.source_prefix if args.source_prefix is not None else ""
 
@@ -453,6 +445,8 @@ def main():
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 1):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+        logger.info(f"attention mask {index} size of the training set: {len(train_dataset[index]['attention_mask'])}.")
+        
 
     label_pad_token_id = -100 if args.ignore_pad_token_for_loss else tokenizer.pad_token_id
     data_collator = DataCollatorForSeq2Seq(
@@ -528,41 +522,34 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=False)#not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
-    if args.evaluation_only:
-        args.num_train_epochs=1
 
-    args.output_dir+=date+"/" 
     for epoch in range(args.num_train_epochs):
-        if (args.evaluation_only==False):
-            model.train()
-            for step, batch in enumerate(train_dataloader):
-                outputs = model(**batch)
-                loss = outputs.loss
-                loss = loss / args.gradient_accumulation_steps
-                accelerator.backward(loss)
-                if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
-                    progress_bar.update(1)
-                    completed_steps += 1
+        model.train()
+        for step, batch in enumerate(train_dataloader):
+            logger.info(f"  Input size = {batch['input_ids'].shape}, label size = {batch['labels'].shape}")
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss = loss / args.gradient_accumulation_steps
+            accelerator.backward(loss)
+            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+                progress_bar.update(1)
+                completed_steps += 1
 
-                if completed_steps >= args.max_train_steps:
-                    break        
+            if completed_steps >= args.max_train_steps:
+                break
 
         model.eval()
-        logging.info("Evaluating model")
         if args.val_max_target_length is None:
             args.val_max_target_length = args.max_target_length
 
-        #TODO:use cached past key/value states to speed up decoding or not. By default, set to True
-        use_cache = True
         gen_kwargs = {
             "max_length": args.val_max_target_length if args is not None else config.max_length,
             "num_beams": args.num_beams,
-            "use_cache": use_cache,
         }
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
@@ -601,15 +588,11 @@ def main():
         result = {k: round(v, 4) for k, v in result.items()}
 
         logger.info(result)
-        #only run evaluataion once
-        if (args.evaluation_only):
-            break
 
-        if args.output_dir is not None:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            logger.info("Saving model",args.output_dir)
-            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+    if args.output_dir is not None:
+        accelerator.wait_for_everyone()
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
 
 
 if __name__ == "__main__":

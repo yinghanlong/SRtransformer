@@ -918,6 +918,7 @@ class GenerationMixin:
         encoder_input_ids = input_ids if self.config.is_encoder_decoder else None
 
         if self.config.is_encoder_decoder:
+            #print('The model is encoder-decoder')
             # add encoder_outputs to model_kwargs
             model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(input_ids, model_kwargs)
 
@@ -1293,6 +1294,7 @@ class GenerationMixin:
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                t= cur_len-1 #Yinghan: current time step
             )
 
             if synced_gpus and this_peer_finished:

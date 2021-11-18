@@ -14,7 +14,8 @@
 # limitations under the License.
 """ PyTorch T5 model. """
 
-
+import torch.nn.functional as F
+from torch.autograd import Variable
 import copy
 import math
 import os
@@ -254,12 +255,27 @@ class T5DenseReluDense(nn.Module):
         self.wi = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout_rate)
+        self.is_decoder = config.is_decoder 
 
-    def forward(self, hidden_states):
-        hidden_states = self.wi(hidden_states)
-        hidden_states = nn.functional.relu(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.wo(hidden_states)
+    def forward(self, hidden_states,  t=0):
+        if self.training or not self.is_decoder:
+            hidden_states = self.wi(hidden_states)
+            hidden_states = nn.functional.relu(hidden_states)
+            hidden_states = self.dropout(hidden_states)
+            hidden_states = self.wo(hidden_states)
+        else:#Yinghan: only take hidden states of the current timestep during inference
+            input_shape=hidden_states.shape #[batch,seq_length,hidden_dim]
+            if t>1:
+                print(input_shape,t)
+            hidden_states = hidden_states[:,input_shape[1]-1,:]
+            #hidden_states= hidden_states.view(-1, hidden_states.size(-1)) 
+            hidden_states = self.wi(hidden_states)
+            hidden_states = nn.functional.relu(hidden_states)
+            hidden_states = self.dropout(hidden_states)
+            hidden_states = self.wo(hidden_states)
+            #expand the dim of output
+            hidden_states= hidden_states.view(-1, 1, hidden_states.size(-1)) 
+            hidden_states = hidden_states.expand(input_shape)
         return hidden_states
 
 
@@ -271,13 +287,26 @@ class T5DenseGatedGeluDense(nn.Module):
         self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout_rate)
         self.gelu_act = ACT2FN["gelu_new"]
+        self.is_decoder = config.is_decoder 
 
-    def forward(self, hidden_states):
-        hidden_gelu = self.gelu_act(self.wi_0(hidden_states))
-        hidden_linear = self.wi_1(hidden_states)
-        hidden_states = hidden_gelu * hidden_linear
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.wo(hidden_states)
+    def forward(self, hidden_states, t=0):
+        if self.training or not self.is_decoder:
+            hidden_gelu = self.gelu_act(self.wi_0(hidden_states))
+            hidden_linear = self.wi_1(hidden_states)
+            hidden_states = hidden_gelu * hidden_linear
+            hidden_states = self.dropout(hidden_states)
+            hidden_states = self.wo(hidden_states)
+        else:
+            input_shape=hidden_states.shape 
+            hidden_states = hidden_states[:,t,:]
+            hidden_gelu = self.gelu_act(self.wi_0(hidden_states))
+            hidden_linear = self.wi_1(hidden_states)
+            hidden_states = hidden_gelu * hidden_linear
+            hidden_states = self.dropout(hidden_states)
+            hidden_states = self.wo(hidden_states)
+            #expand the dim of output
+            hidden_states= hidden_states.view(-1, 1, hidden_states.size(-1)) 
+            hidden_states = hidden_states.expand(input_shape)
         return hidden_states
 
 
@@ -292,20 +321,48 @@ class T5LayerFF(nn.Module):
             raise ValueError(
                 f"{self.config.feed_forward_proj} is not supported. Choose between `relu` and `gated-gelu`"
             )
-
+        self.is_decoder = config.is_decoder 
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states,t=0):
         forwarded_states = self.layer_norm(hidden_states)
-        forwarded_states = self.DenseReluDense(forwarded_states)
+        forwarded_states = self.DenseReluDense(forwarded_states,t)
+        #TODO: add spiking integrate-and-fire mem
         hidden_states = hidden_states + self.dropout(forwarded_states)
         return hidden_states
 
+#For spiking neural network
+class LinearSpike(torch.autograd.Function):
+    """
+    Here we use the piecewise-linear surrogate gradient as was done
+    in Bellec et al. (2018).
+    """
+    gamma = 0.3 # Controls the dampening of the piecewise-linear surrogate gradient
+
+    @staticmethod
+    def forward(ctx, input):
+        
+        ctx.save_for_backward(input)
+        out = torch.zeros_like(input).cuda()
+        out[input > 0] = 1.0
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        
+        input,     = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        grad       = LinearSpike.gamma*F.threshold(1.0-torch.abs(input), 0, 0)
+        return grad*grad_input, None
 
 class T5Attention(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias=False):
+    def __init__(self, config: T5Config, has_relative_attention_bias=False, use_mem=False):
         super().__init__()
+        self.use_mem = use_mem
+        if use_mem: #spiking activation
+            self.act_func 	= LinearSpike.apply
+            self.threshold  = Variable(torch.randn(1),requires_grad=True)
         self.is_decoder = config.is_decoder
         self.has_relative_attention_bias = has_relative_attention_bias
 
@@ -420,6 +477,8 @@ class T5Attention(nn.Module):
         query_length=None,
         use_cache=False,
         output_attentions=False,
+        t=0,
+        max_length=200,
     ):
         """
         Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
@@ -430,6 +489,15 @@ class T5Attention(nn.Module):
         batch_size, seq_length = hidden_states.shape[:2]
 
         real_seq_length = seq_length
+        if t==0: #initialize spiking neurons
+            if self.training:
+                mem_length = seq_length
+            else:
+                mem_length = max_length
+            # (batch_size, n_heads, key_length, dim_per_head)
+            self.key_states_mem = torch.rand(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
+            self.value_states_mem = torch.rand(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
+
 
         if past_key_value is not None:
             assert (
@@ -458,16 +526,38 @@ class T5Attention(nn.Module):
                 # (batch_size, n_heads, seq_length, dim_per_head)
                 hidden_states = shape(proj_layer(key_value_states))
 
+            #use cache for generation, not used for training
             if past_key_value is not None:
                 if key_value_states is None:
                     # self-attn
                     # (batch_size, n_heads, key_length, dim_per_head)
-                    hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
+                    if self.use_mem== False: #do not use this if spiking neurons are used
+                        hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
+                    else:
+                        hidden_states = hidden_states
                 else:
                     # cross-attn
                     hidden_states = past_key_value
             return hidden_states
 
+        def integrate_and_fire(input_states, hidden_states,t):
+            # (batch_size, n_heads, key_length, dim_per_head)
+            batch_size = hidden_states.shape[0]
+            self.threshold=self.threshold.to(hidden_states.device)
+            if self.training==True:
+                hidden_states = hidden_states + input_states
+                mem_thr 		= (hidden_states/self.threshold.to(hidden_states.device)) - 1.0 
+                out 			= self.act_func(mem_thr)
+            else:
+                #print(hidden_states[:,:,t,:].shape, input_states.shape, t)
+                current_state = torch.unsqueeze(hidden_states[:,:,t,:],dim=2)
+                hidden_states_update = current_state + input_states
+                hidden_states[:,:,t,:] = torch.squeeze(hidden_states_update,dim=2)
+                mem_thr 		= (hidden_states[:,:,:t+1,:]/self.threshold) - 1.0 
+                out 			= self.act_func(mem_thr)
+            #rst 			= self.threshold[l]* (mem_thr>0).float()
+            #self.mem[l] 	= self.leak*self.mem[l] + input_states - rst
+            return out , hidden_states
         # get query states
         query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
 
@@ -478,6 +568,17 @@ class T5Attention(nn.Module):
         value_states = project(
             hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
         )
+
+        #TODO: add spiking integrate-and-fire neurons as memory for self attention
+        #if key_value_states is None:
+        #    print('self attention size',query_states.shape, key_states.shape, value_states.shape)
+        #else:
+        #    print('cross attention size',query_states.shape, key_states.shape, value_states.shape)
+
+        if key_value_states is None and self.use_mem:
+            key_states, self.key_states_mem = integrate_and_fire(key_states, self.key_states_mem, t)
+            value_states, self.value_states_mem = integrate_and_fire(value_states, self.value_states_mem, t)
+
 
         # compute scores
         scores = torch.matmul(
@@ -501,6 +602,7 @@ class T5Attention(nn.Module):
 
             if mask is not None:
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
+                #print('Check Mask', mask.shape,mask)
 
         scores += position_bias
         attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
@@ -517,6 +619,9 @@ class T5Attention(nn.Module):
         attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
         attn_output = self.o(attn_output)
 
+        #print('attn_output size', attn_output.shape)
+        #print('q,k,v size', query_states.shape,key_states.shape, value_states.shape)
+
         present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
         outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
 
@@ -526,9 +631,9 @@ class T5Attention(nn.Module):
 
 
 class T5LayerSelfAttention(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, has_relative_attention_bias=False, use_mem=True):
         super().__init__()
-        self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias)
+        self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias, use_mem=use_mem)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -541,6 +646,8 @@ class T5LayerSelfAttention(nn.Module):
         past_key_value=None,
         use_cache=False,
         output_attentions=False,
+        t=0,
+        max_length=200,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.SelfAttention(
@@ -551,6 +658,8 @@ class T5LayerSelfAttention(nn.Module):
             past_key_value=past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            t=t,
+            max_length=max_length,
         )
         hidden_states = hidden_states + self.dropout(attention_output[0])
         outputs = (hidden_states,) + attention_output[1:]  # add attentions if we output them
@@ -598,7 +707,7 @@ class T5Block(nn.Module):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
-        self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
+        self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias,use_mem=self.is_decoder))
         if self.is_decoder:
             self.layer.append(T5LayerCrossAttention(config))
 
@@ -618,6 +727,8 @@ class T5Block(nn.Module):
         use_cache=False,
         output_attentions=False,
         return_dict=True,
+        t=0,#for decoder
+        max_length=200,
     ):
 
         if past_key_value is not None:
@@ -644,6 +755,8 @@ class T5Block(nn.Module):
             past_key_value=self_attn_past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            t=t,
+            max_length=max_length,
         )
         hidden_states, present_key_value_state = self_attention_outputs[:2]
         attention_outputs = self_attention_outputs[2:]  # Keep self-attention outputs and relative position weights
@@ -867,6 +980,8 @@ class T5Stack(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        t=0,#time step for generation
+        max_length=200,
     ):
         # Model parallel
         if self.model_parallel:
@@ -1007,6 +1122,8 @@ class T5Stack(T5PreTrainedModel):
                     past_key_value=past_key_value,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    t=t,
+                    max_length=max_length,
                 )
 
             # layer_outputs is a tuple with:
@@ -1522,6 +1639,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        t=0,
+        max_length=200,
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
@@ -1622,6 +1741,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            t=t,#Yinghan: add current time step as input to decoder
+            max_length=max_length,
         )
 
         sequence_output = decoder_outputs[0]
@@ -1671,12 +1792,15 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         cross_attn_head_mask=None,
         use_cache=None,
         encoder_outputs=None,
+        max_length=200,
         **kwargs
     ):
 
         # cut decoder_input_ids if past is used
         if past is not None:
+            #print('Prepare inputs',input_ids.shape)
             input_ids = input_ids[:, -1:]
+            #print('Cut inputs',input_ids.shape)
 
         return {
             "decoder_input_ids": input_ids,
@@ -1687,6 +1811,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,
+            "max_length": max_length,
         }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
