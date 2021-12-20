@@ -362,7 +362,12 @@ class T5Attention(nn.Module):
         self.use_mem = use_mem
         if use_mem: #spiking activation
             self.act_func 	= LinearSpike.apply
-            self.threshold  = Variable(torch.randn(1),requires_grad=True)
+            #self.threshold  = Variable(torch.randn(1),requires_grad=True)
+            self.threshold  = torch.nn.Parameter(torch.ones(1),requires_grad=True).cuda()
+            self.local_connect  =torch.nn.Parameter(torch.randn(4),requires_grad=True).cuda()
+            
+            #TODO: set connection types. 0:recurrent, 1:cumulative ,2:direct
+            self.connect_type= 1
         self.is_decoder = config.is_decoder
         self.has_relative_attention_bias = has_relative_attention_bias
 
@@ -493,11 +498,10 @@ class T5Attention(nn.Module):
             if self.training:
                 mem_length = seq_length
             else:
-                mem_length = max_length
+                mem_length = 1
             # (batch_size, n_heads, key_length, dim_per_head)
-            self.key_states_mem = torch.rand(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
-            self.value_states_mem = torch.rand(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
-
+            self.key_states_mem = torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
+            self.value_states_mem = torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
 
         if past_key_value is not None:
             assert (
@@ -543,18 +547,48 @@ class T5Attention(nn.Module):
         def integrate_and_fire(input_states, hidden_states,t):
             # (batch_size, n_heads, key_length, dim_per_head)
             batch_size = hidden_states.shape[0]
+            n_heads =hidden_states.shape[1]
+            key_len =hidden_states.shape[2]
+            dim =hidden_states.shape[3]
             self.threshold=self.threshold.to(hidden_states.device)
             if self.training==True:
-                hidden_states = hidden_states + input_states
-                mem_thr 		= (hidden_states/self.threshold.to(hidden_states.device)) - 1.0 
+                if self.connect_type==0:
+                    hidden_states = torch.cumsum(input_states,dim=2)
+                elif self.connect_type==1:
+                    for c in range(4):
+                        intermediate= input_states*self.local_connect[c]
+                        if c>0:
+                            intermediate= torch.cat((intermediate[:,:,c:,:], torch.zeros(batch_size,n_heads,c,dim).cuda()),dim=2)
+                        hidden_states += intermediate
+                elif self.connect_type==2:
+                    hidden_states +=  input_states
+                mem_thr 		= (hidden_states/self.threshold) - 1.0 
                 out 			= self.act_func(mem_thr)
             else:
                 #print(hidden_states[:,:,t,:].shape, input_states.shape, t)
-                current_state = torch.unsqueeze(hidden_states[:,:,t,:],dim=2)
-                hidden_states_update = current_state + input_states
-                hidden_states[:,:,t,:] = torch.squeeze(hidden_states_update,dim=2)
-                mem_thr 		= (hidden_states[:,:,:t+1,:]/self.threshold) - 1.0 
+                #current_state = torch.unsqueeze(hidden_states[:,:,t,:],dim=2)
+                #hidden_states_update = current_state + input_states
+                #hidden_states[:,:,t,:] = torch.squeeze(hidden_states_update,dim=2)
+                #mem_thr 		= (hidden_states[:,:,:t+1,:]/self.threshold) - 1.0 
+                if t==0:
+                    hidden_states = input_states
+                else:
+                    if self.connect_type==0:
+                        hidden_states = torch.cat([hidden_states, hidden_states+input_states], dim=2)
+                    elif self.connect_type==1:
+                        for c in range(4):
+                            intermediate= input_states*self.local_connect[c]
+                            if t+c < hidden_states.shape[2]:
+                                intermediate= torch.cat((intermediate[:,:,t+c:,:], torch.zeros(batch_size,n_heads,t+c,dim).cuda()),dim=2)
+                                hidden_states += intermediate
+                            else:
+                                hidden_states= torch.cat([hidden_states, intermediate], dim=2)
+                    elif self.connect_type==2:
+                        hidden_states = torch.cat([hidden_states, input_states], dim=2)
+                mem_thr 		= (hidden_states/self.threshold) - 1.0 
                 out 			= self.act_func(mem_thr)
+            self.spiking_rate= torch.count_nonzero(out)/(out.shape[0]*out.shape[1]*out.shape[2]*out.shape[3])
+
             #rst 			= self.threshold[l]* (mem_thr>0).float()
             #self.mem[l] 	= self.leak*self.mem[l] + input_states - rst
             return out , hidden_states
@@ -601,7 +635,7 @@ class T5Attention(nn.Module):
                 position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
 
             if mask is not None:
-                position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
+                position_bias = position_bias + mask.to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
                 #print('Check Mask', mask.shape,mask)
 
         scores += position_bias

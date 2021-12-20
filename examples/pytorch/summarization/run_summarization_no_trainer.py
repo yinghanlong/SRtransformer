@@ -51,7 +51,7 @@ from transformers import (
 from transformers.file_utils import is_offline_mode
 from transformers.utils.versions import require_version
 
-date= datetime.now().strftime('%Y-%m-%d')
+date= datetime.now().strftime('%Y-%m-%d-%H-%M')
 logger = logging.getLogger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
 
@@ -188,12 +188,9 @@ def parse_args():
         default=None,
         help="Pretrained config name or path if not the same as model_name",
     )
-    parser.add_argument(
-        "--gpu",
-        type=str,
-        default='0',
-        help="select gpu",
-    )
+    
+    parser.add_argument('--gpus', metavar='DEV_ID', default='0',
+                        help='Comma-separated list of GPU device IDs to be used (default is to use all available devices)')
     parser.add_argument(
         "--tokenizer_name",
         type=str,
@@ -282,6 +279,7 @@ def parse_args():
             extension = args.validation_file.split(".")[-1]
             assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
 
+    args.output_dir+=date+"/" 
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
@@ -306,14 +304,14 @@ def main():
     accelerator = Accelerator()
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
+        filename=args.output_dir+'results.log', #save to a log file
+        filemode='a',
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
     logger.info(accelerator.state)
     logger.info(accelerator.device)
-    #select gpu device
-    device= torch.device('cuda:'+args.gpu)  
 
     # Setup logging, we only want one process per machine to log things on the screen.
     # accelerator.is_local_main_process is only True for one process per machine.
@@ -493,9 +491,33 @@ def main():
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
-    )
+    #model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+    #    model, optimizer, train_dataloader, eval_dataloader)
+
+    #TODO:set up data parallelism
+    if not torch.cuda.is_available():
+        # Set GPU index to -1 if using CPU
+        args.device = 'cpu'
+        args.gpus = -1
+    else:
+        args.device = 'cuda'
+        if args.gpus is not None:
+            try:
+                args.gpus = [int(s) for s in args.gpus.split(',')]
+            except ValueError:
+                logging.error('ERROR: Argument --gpus must be a comma-separated list of integers only')
+                exit(1)
+            available_gpus = torch.cuda.device_count()
+            for dev_id in args.gpus:
+                if dev_id >= available_gpus:
+                    logging.error('ERROR: GPU device ID {0} requested, but only {1} devices available'
+                                    .format(dev_id, available_gpus))
+                    exit(1)
+            # Set default device in case the first one on the list != 0
+            torch.cuda.set_device(args.gpus[0])
+    model = torch.nn.DataParallel(model, device_ids=args.gpus)
+    model = model.to(args.device)
+    print(model) #show layer names
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
@@ -533,15 +555,21 @@ def main():
     if args.evaluation_only:
         args.num_train_epochs=1
 
-    args.output_dir+=date+"/" 
+        
     for epoch in range(args.num_train_epochs):
+
+        logger.info('Connect type=',model.module.decoder.block[0].layer[0].SelfAttention.connect_type)
         if (args.evaluation_only==False):
             model.train()
+            avg_spiking_rate= torch.zeros(12)
+            total_steps=0
+            avg_loss=0
             for step, batch in enumerate(train_dataloader):
                 outputs = model(**batch)
                 loss = outputs.loss
                 loss = loss / args.gradient_accumulation_steps
-                accelerator.backward(loss)
+                avg_loss+=loss
+                loss.backward() #accelerator.backward(loss)
                 if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                     optimizer.step()
                     lr_scheduler.step()
@@ -551,6 +579,18 @@ def main():
 
                 if completed_steps >= args.max_train_steps:
                     break        
+                #calculate average spiking rates
+
+                if step%100==0:
+                    for i in range(12):
+                        print('loss ', loss)
+                        print('Layer ',i,avg_spiking_rate[i]/step)
+                        print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
+                    avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
+                total_steps= step
+        avg_spiking_rate/=total_steps
+        logger.info('average spiking rate=', avg_spiking_rate)
+        logger.info('Avg Loss=', avg_loss)
 
         model.eval()
         logging.info("Evaluating model")
@@ -564,18 +604,26 @@ def main():
             "num_beams": args.num_beams,
             "use_cache": use_cache,
         }
+        avg_spiking_rate= torch.zeros(12)
+        total_steps=0
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-                generated_tokens = accelerator.unwrap_model(model).generate(
-                    batch["input_ids"],
+                generated_tokens = model.module.generate(#accelerator.unwrap_model(model).generate(
+                    batch["input_ids"].to(args.device),
                     attention_mask=batch["attention_mask"],
                     **gen_kwargs,
                 )
+                #calculate average spiking rates
+                for i in range(12):
+                    if step%200==0:
+                        print('Layer ',i,avg_spiking_rate[i]/step)
+                        print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
+                    avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
 
                 generated_tokens = accelerator.pad_across_processes(
                     generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
                 )
-                labels = batch["labels"]
+                labels = batch["labels"].to(args.device)
                 if not args.pad_to_max_length:
                     # If we did not pad to max length, we need to pad the labels too
                     labels = accelerator.pad_across_processes(batch["labels"], dim=1, pad_index=tokenizer.pad_token_id)
@@ -594,6 +642,10 @@ def main():
                 decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
                 metric.add_batch(predictions=decoded_preds, references=decoded_labels)
+                total_steps= step
+        avg_spiking_rate/=total_steps
+        logger.info('average spiking rate=', avg_spiking_rate)
+        
         result = metric.compute(use_stemmer=True)
         # Extract a few results from ROUGE
         result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
@@ -607,9 +659,10 @@ def main():
 
         if args.output_dir is not None:
             accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
             logger.info("Saving model",args.output_dir)
-            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+            #unwrapped_model = accelerator.unwrap_model(model)
+            #unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+            model.save_pretrained(args.output_dir)
 
 
 if __name__ == "__main__":
