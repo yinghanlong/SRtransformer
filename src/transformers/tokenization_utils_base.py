@@ -1632,7 +1632,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
         vocab_files = {}
         init_configuration = {}
-
+        #NOTE:disabled this to always download tokenizer
         if os.path.isfile(pretrained_model_name_or_path) or is_remote_url(pretrained_model_name_or_path):
             if len(cls.vocab_files_names) > 1:
                 raise ValueError(
@@ -1678,13 +1678,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
                         revision=revision,
                         mirror=None,
                     )
-                full_file_name = hf_bucket_url(
-                    pretrained_model_name_or_path,
-                    filename=file_name,
-                    subfolder=subfolder,
-                    revision=revision,
-                    mirror=None,
-                ) 
+                
 
                 vocab_files[file_id] = full_file_name
 

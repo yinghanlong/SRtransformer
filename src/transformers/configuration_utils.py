@@ -523,15 +523,17 @@ class PretrainedConfig(PushToHubMixin):
             local_files_only = True
 
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+        print('CONFIG FILE',pretrained_model_name_or_path)
         if os.path.isdir(pretrained_model_name_or_path):
+            #print("IS DIRECTORY")
             config_file = os.path.join(pretrained_model_name_or_path, CONFIG_NAME)
-        elif os.path.isfile(pretrained_model_name_or_path) or is_remote_url(pretrained_model_name_or_path):
+        elif os.path.isfile(pretrained_model_name_or_path):# or is_remote_url(pretrained_model_name_or_path):
             config_file = pretrained_model_name_or_path
         else:
             config_file = hf_bucket_url(
                 pretrained_model_name_or_path, filename=CONFIG_NAME, revision=revision, mirror=None
             )
-        config_file = hf_bucket_url(pretrained_model_name_or_path, filename=CONFIG_NAME, revision=revision, mirror=None)
+        #config_file = hf_bucket_url(pretrained_model_name_or_path, filename=CONFIG_NAME, revision=revision, mirror=None)
         logger.info("config file:",config_file)
         try:
             # Load from URL or cache if already cached

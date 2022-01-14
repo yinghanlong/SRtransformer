@@ -316,6 +316,8 @@ def get_tokenizer_config(
         config_file = hf_bucket_url(
             pretrained_model_name_or_path, filename=TOKENIZER_CONFIG_FILE, revision=revision, mirror=None
         )
+    #config_file = hf_bucket_url(
+    #        pretrained_model_name_or_path, filename=TOKENIZER_CONFIG_FILE, revision=revision, mirror=None)
 
     try:
         # Load from URL or cache if already cached
