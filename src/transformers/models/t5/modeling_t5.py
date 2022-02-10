@@ -345,7 +345,8 @@ class LinearSpike(torch.autograd.Function):
         
         ctx.save_for_backward(input)
         out = torch.zeros_like(input).cuda()
-        out[input > 0] = 1.0
+        out[input > 0] = input[input > 0] #1.0 #TODO: binary spike or full-precision?
+        out[input> 1.0] = 1.0
         return out
 
     @staticmethod
@@ -353,25 +354,20 @@ class LinearSpike(torch.autograd.Function):
         
         input,     = ctx.saved_tensors
         grad_input = grad_output.clone()
-        grad       = LinearSpike.gamma*F.threshold(1.0-torch.abs(input), 0, 0)
+        #equation 3:if out[input>1]=1, out[0<input<1]=input
+        grad = LinearSpike.gamma*F.threshold(1.0-torch.abs(2.0*input-1.0), 0, 0)
+        #equation 2: if out[input>0]=input
+        #grad = torch.zeros_like(input).cuda()
+        #grad [input > 0]      = 1.0
+        #grad       = LinearSpike.gamma*F.threshold(input, 0, 0)
+
+        #equation 1: if out[input>0]=1
+        #grad       = LinearSpike.gamma*F.threshold(1.0-torch.abs(input), 0, 0)
         return grad*grad_input, None
 
 class T5Attention(nn.Module):
     def __init__(self, config: T5Config, has_relative_attention_bias=False, use_mem=False):
         super().__init__()
-        self.use_mem = use_mem
-        if use_mem==True: #spiking activation
-            self.act_func 	= LinearSpike.apply
-            #self.threshold  = Variable(torch.randn(1),requires_grad=True).cuda()
-            self.threshold  = torch.nn.Parameter(torch.ones(1),requires_grad=True)
-            self.local_connect  =torch.nn.Parameter(torch.randn(4),requires_grad=True)
-            
-            #TODO: set connection types. 0:recurrent, 1:cumulative ,2:direct
-            self.connect_type= 0
-            self.enable_reset=True
-            logger.info(f"Using spiking mem")
-            if self.enable_reset==True:
-                logger.info(f"Resetting spiking mem {self.threshold}")
         self.is_decoder = config.is_decoder
         self.has_relative_attention_bias = has_relative_attention_bias
 
@@ -382,6 +378,21 @@ class T5Attention(nn.Module):
         self.dropout = config.dropout_rate
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
+        self.use_mem = use_mem
+        if use_mem==True: #spiking activation
+            self.act_func 	= LinearSpike.apply #TODO: try to use relu
+            #self.threshold  = Variable(torch.randn(1),requires_grad=True).cuda()
+            self.threshold  = torch.nn.Parameter(torch.ones(1),requires_grad=True)
+            self.local_connect  =torch.nn.Parameter(torch.randn(4),requires_grad=True)
+            
+            #TODO: set connection types. 0:recurrent, 1:cumulative ,2:direct
+            self.connect_type= 0
+            self.enable_reset=False
+            self.sparse = False
+            logger.info("Using 16 recurrent spiking mem gate!")
+            self.mem_gate = nn.Linear(self.key_value_proj_dim, self.key_value_proj_dim, bias=False)
+            if self.enable_reset==True:
+                logger.info(f"Resetting spiking mem= {self.threshold}")
         # Mesh TensorFlow initialization to avoid scaling before softmax
         self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
@@ -501,12 +512,17 @@ class T5Attention(nn.Module):
         if t==0: #initialize spiking neurons
             if self.training:
                 mem_length = seq_length
+                self.key_mem = None
+                self.value_mem = None
             else:
                 mem_length = 1
+                self.value_mem = torch.zeros(batch_size, self.n_heads, 1,self.key_value_proj_dim).to(hidden_states.device)
+                self.key_mem = torch.zeros(batch_size, self.n_heads, 1,self.key_value_proj_dim).to(hidden_states.device)
+
             # (batch_size, n_heads, key_length, dim_per_head)
             self.key_states_mem = torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
             self.value_states_mem = torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
-
+            
         if past_key_value is not None:
             assert (
                 len(past_key_value) == 2
@@ -548,7 +564,7 @@ class T5Attention(nn.Module):
                     hidden_states = past_key_value
             return hidden_states
 
-        def integrate_and_fire(input_states, hidden_states,t):
+        def integrate_and_fire(input_states, hidden_states,t, mem_potential=None):
             # (batch_size, n_heads, key_length, dim_per_head)
 
             batch_size = hidden_states.shape[0]
@@ -559,7 +575,23 @@ class T5Attention(nn.Module):
             self.local_connect=self.local_connect.to(hidden_states.device)
             if self.training==True:
                 if self.connect_type==0:
-                    hidden_states = torch.cumsum(input_states,dim=2)
+                    #TODO: add a memory gate
+                    hidden_states = input_states
+                    '''
+                    mem_gate_out= self.mem_gate(input_states)
+                    mem_gate_out= torch.cat((torch.zeros(batch_size,n_heads,1,dim).to(mem_gate_out.device), mem_gate_out[:,:,:-1,:]),dim=2)
+                    mem_gate_out = torch.cumsum(mem_gate_out,dim=2)
+                    hidden_states = hidden_states + mem_gate_out
+                    '''
+                    #TODO:recurrent mem
+                    mem_gate_out = input_states
+                    cum_mem = torch.zeros_like(input_states).cuda()
+                    for ti in range(1,16):
+                        mem_gate_out = self.mem_gate(mem_gate_out)
+                        mem_gate_out= torch.cat((torch.zeros(batch_size,n_heads,ti,dim).to(mem_gate_out.device), mem_gate_out[:,:,:-ti,:]),dim=2)
+                        cum_mem += mem_gate_out
+
+                    hidden_states = hidden_states + cum_mem
                 elif self.connect_type==1:
                     for c in range(4):
                         intermediate= input_states*self.local_connect[c]
@@ -573,7 +605,7 @@ class T5Attention(nn.Module):
                 #TODO: reset
                 if self.enable_reset==True:
                     rst 			= self.threshold* (input_states>self.threshold).float()
-                    rst= torch.cat((torch.zeros(batch_size,n_heads,1,dim).to(rst.device), rst[:,:,1:,:]),dim=2)
+                    rst= torch.cat((torch.zeros(batch_size,n_heads,1,dim).to(rst.device), rst[:,:,:-1,:]),dim=2)
                     rst = torch.cumsum(rst,dim=2)
                     #shift reset to right by one timestep
                     hidden_states = hidden_states - rst
@@ -588,10 +620,32 @@ class T5Attention(nn.Module):
                 #mem_thr 		= (hidden_states[:,:,:t+1,:]/self.threshold) - 1.0 
                 if t==0:
                     hidden_states = input_states
+                    mem_potential = self.mem_gate(input_states)
                 else:
                     if self.connect_type==0:
-                        current_state = torch.unsqueeze(hidden_states[:,:,-1,:],dim=2)
-                        hidden_states = torch.cat((hidden_states, current_state+input_states), dim=2)
+                        #current_state = torch.unsqueeze(hidden_states[:,:,-1,:],dim=2)
+
+                        #TODO: add a memory gate
+                        #current_state= self.mem_gate(current_state)
+                        '''
+                        #mem_potential= mem_potential + self.mem_gate(input_states)
+                        hidden_states = torch.cat((hidden_states, mem_potential+input_states), dim=2)
+                        mem_potential= mem_potential + self.mem_gate(input_states)
+                        '''
+
+                        #TODO: remember a window of 16 timesteps
+                        cum_mem = torch.sum(mem_potential, dim=2, keepdim=True)
+                        hidden_states = torch.cat((hidden_states, cum_mem +input_states), dim=2)
+                        #update membrane potential (memory)
+                        mem_potential= torch.cat((mem_potential,input_states),dim=2)
+                        if mem_potential.shape[2]>16:
+                            mem_potential = mem_potential[:,:,-16:-1,:]
+                        #all 16 mems pass through mem gate again
+                        mem_potential = self.mem_gate(mem_potential)
+
+                        
+
+
                     elif self.connect_type==1:
                         for c in range(4):
                             intermediate= input_states*self.local_connect[c]
@@ -614,7 +668,8 @@ class T5Attention(nn.Module):
 
             #rst 			= self.threshold[l]* (mem_thr>0).float()
             #self.mem[l] 	= self.leak*self.mem[l] + input_states - rst
-            return out , hidden_states
+            return out, hidden_states, mem_potential
+
         # get query states
         query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
 
@@ -633,14 +688,56 @@ class T5Attention(nn.Module):
         #    print('cross attention size',query_states.shape, key_states.shape, value_states.shape)
 
         if key_value_states is None and self.use_mem==True:
-            key_states, self.key_states_mem = integrate_and_fire(key_states, self.key_states_mem, t)
-            value_states, self.value_states_mem = integrate_and_fire(value_states, self.value_states_mem, t)
+            key_states, self.key_states_mem, self.key_mem = integrate_and_fire(key_states, self.key_states_mem, t, self.key_mem)
+            value_states, self.value_states_mem, self.value_mem = integrate_and_fire(value_states, self.value_states_mem, t, self.value_mem)
 
+        def batch_sparse_mm(mat1, mat2):
+            '''
+            #TODO: mat1: sparse; mat2: dense
+            '''
+            k2=mat1.shape[2]
+            k3=mat1.shape[3]
+            q2=mat2.shape[2]
+            q3=mat2.shape[3]
+            
+            #bnkd-> (b*n)kd-> (b*n*k)d
+            mat1 =mat1.reshape(-1, k2, k3).transpose(0,1)
+            mat1 =mat1.reshape(k2,-1)
+            mat1 = mat1.to_sparse()
+            #bnqd-> (b*n*q)d ->d(b*n)q
+            mat2 = mat2.transpose(3,2).reshape(-1,q3,q2).reshape(-1,q2)
+            out = torch.sparse.mm(mat1, mat2)
+            #reshape output "k(b*n*d)q->bnkq"
+            scores = scores.reshape(batch_size, self.n_heads, q2, k2)
 
         # compute scores
-        scores = torch.matmul(
-            query_states, key_states.transpose(3, 2)
-        )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
+        if self.sparse==True: #TODO: convert to sparse matrix
+            k2=key_states.shape[2]
+            k3=key_states.shape[3]
+            q2=query_states.shape[2]
+            q3=query_states.shape[3]
+            key_states =key_states.reshape(-1, k2, k3)
+            query_states= query_states.reshape(-1,q2,q3).transpose(2, 1)
+            scores = torch.zeros(batch_size*self.n_heads, q2, k2).cuda()
+            for i in range(scores.shape[0]):
+                scores_part = torch.sparse.mm(key_states[i,:,:].to_sparse(), query_states[i,:,:]) #"(bn)kd,(bn)dq->bnkq"
+                scores[i,:,:] = scores_part.transpose(1,0).unsqueeze(0)
+            scores = scores.reshape(batch_size, self.n_heads, q2, k2)
+            '''
+            scores = torch.zeros(batch_size,self.n_heads,q_dim,k_dim)
+            scores = scores.cuda()
+            for i in range(batch_size):
+                for j in range(self.n_heads):
+                    qs =query_states[i,j,:,:].to_sparse()
+                    ks =key_states[i,j,:,:].to_sparse()
+                    scores_part = torch.sparse.mm( qs, ks)
+                    scores_part = scores_part.to_dense()
+                    scores[i,j,:,:] = scores_part.view(1,1,q_dim,-1)
+            '''        
+        else:
+            scores = torch.matmul(
+                query_states, key_states.transpose(3, 2)
+            )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
 
         if position_bias is None:
             if not self.has_relative_attention_bias:
@@ -673,7 +770,26 @@ class T5Attention(nn.Module):
         if layer_head_mask is not None:
             attn_weights = attn_weights * layer_head_mask
 
-        attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
+        if self.sparse==True: #TODO: convert to sparse matrix
+            v2=value_states.shape[2]
+            v3=value_states.shape[3]
+            a2=attn_weights.shape[2]
+            a3=attn_weights.shape[3]
+            value_states = value_states.transpose(3,2)
+            value_states =value_states.reshape(-1, v3, v2)
+            attn_weights =attn_weights.reshape(-1, a2, a3).transpose(2, 1)
+            #attn_output = torch.bmm(value_states,attn_weights)  #(bndv,bnkq)->(bndq)
+
+            attn_output = torch.zeros(batch_size*self.n_heads, a2, v3).cuda()
+            for i in range(attn_output.shape[0]):
+                attn_part = torch.sparse.mm(value_states[i,:,:].to_sparse(),attn_weights[i,:,:].to_sparse()) #"(bn)kd,(bn)dq->bnkq"
+                attn_part = attn_part.to_dense()
+                attn_output[i,:,:] = attn_part.transpose(1,0).unsqueeze(0)
+            
+            attn_output = attn_output.reshape(batch_size,self.n_heads, a2, v3)
+        else:
+            attn_output = torch.matmul(attn_weights, value_states) #(bnqk,bnvd)->(bnqd)
+        attn_output = unshape(attn_output)  # (batch_size, seq_length, dim)
         attn_output = self.o(attn_output)
 
         #print('attn_output size', attn_output.shape)
@@ -764,7 +880,7 @@ class T5Block(nn.Module):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
-        self.use_mem = False #TODO: use spiking networks or not
+        self.use_mem = True #TODO: use spiking networks or not
         self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias,use_mem=(self.is_decoder and self.use_mem)))
         if self.is_decoder:
             self.layer.append(T5LayerCrossAttention(config))

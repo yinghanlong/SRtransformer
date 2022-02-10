@@ -556,7 +556,7 @@ def main():
         args.num_train_epochs=1
 
     log_step= 500
-    use_mem = False #TODO: set to true for spiking networks
+    use_mem = True #TODO: set to true for spiking networks
     
     for epoch in range(args.num_train_epochs):
         if use_mem:
@@ -653,7 +653,10 @@ def main():
                 metric.add_batch(predictions=decoded_preds, references=decoded_labels)
                 total_steps= step/log_step
         avg_spiking_rate/=total_steps
-        logger.info('average spiking rate=', avg_spiking_rate)
+        logger.info(f"average spiking rate={avg_spiking_rate}")
+        #logger.info(f"average spiking rate={torch.mean(avg_spiking_rate)}")
+        #for i in range(12):
+        #    logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
         
         result = metric.compute(use_stemmer=True)
         # Extract a few results from ROUGE
