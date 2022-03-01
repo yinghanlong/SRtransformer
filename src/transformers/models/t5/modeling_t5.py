@@ -379,6 +379,7 @@ class T5Attention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         self.use_mem = use_mem
+        self.sparse = False
         if use_mem==True: #spiking activation
             self.act_func 	= LinearSpike.apply #TODO: try to use relu
             #self.threshold  = Variable(torch.randn(1),requires_grad=True).cuda()
@@ -388,9 +389,9 @@ class T5Attention(nn.Module):
             #TODO: set connection types. 0:recurrent, 1:cumulative ,2:direct
             self.connect_type= 0
             self.enable_reset=False
-            self.sparse = False
             logger.info("Using 16 recurrent spiking mem gate!")
             self.mem_gate = nn.Linear(self.key_value_proj_dim, self.key_value_proj_dim, bias=False)
+            self.out_gate = nn.Linear(self.key_value_proj_dim, self.key_value_proj_dim, bias=False)
             if self.enable_reset==True:
                 logger.info(f"Resetting spiking mem= {self.threshold}")
         # Mesh TensorFlow initialization to avoid scaling before softmax
@@ -584,14 +585,26 @@ class T5Attention(nn.Module):
                     hidden_states = hidden_states + mem_gate_out
                     '''
                     #TODO:recurrent mem
+                    
                     mem_gate_out = input_states
-                    cum_mem = torch.zeros_like(input_states).cuda()
+                    #hidden_states = input_states #torch.zeros_like(input_states).cuda()
                     for ti in range(1,16):
-                        mem_gate_out = self.mem_gate(mem_gate_out)
+                        mem_gate_out = self.mem_gate(hidden_states) #self.mem_gate(mem_gate_out)
                         mem_gate_out= torch.cat((torch.zeros(batch_size,n_heads,ti,dim).to(mem_gate_out.device), mem_gate_out[:,:,:-ti,:]),dim=2)
+                        hidden_states += mem_gate_out
+                    
+                    #recurrent mem + out gates
+                    '''
+                    hidden_mem = input_states
+                    cum_mem = torch.zeros_like(input_states).cuda()
+                    for ti in range(1,17):
+                        mem_gate_out = self.out_gate(hidden_mem)
+                        hidden_mem  = self.mem_gate(hidden_mem)
+                        hidden_mem = torch.cat((torch.zeros(batch_size,n_heads,ti,dim).to(hidden_mem.device), hidden_mem[:,:,:-ti,:]),dim=2)
                         cum_mem += mem_gate_out
 
                     hidden_states = hidden_states + cum_mem
+                    '''
                 elif self.connect_type==1:
                     for c in range(4):
                         intermediate= input_states*self.local_connect[c]
@@ -619,7 +632,7 @@ class T5Attention(nn.Module):
                 #hidden_states[:,:,t,:] = torch.squeeze(hidden_states_update,dim=2)
                 #mem_thr 		= (hidden_states[:,:,:t+1,:]/self.threshold) - 1.0 
                 if t==0:
-                    hidden_states = input_states
+                    hidden_states = input_states #+ self.out_gate(input_states)
                     mem_potential = self.mem_gate(input_states)
                 else:
                     if self.connect_type==0:
@@ -633,17 +646,53 @@ class T5Attention(nn.Module):
                         mem_potential= mem_potential + self.mem_gate(input_states)
                         '''
 
-                        #TODO: remember a window of 16 timesteps
-                        cum_mem = torch.sum(mem_potential, dim=2, keepdim=True)
-                        hidden_states = torch.cat((hidden_states, cum_mem +input_states), dim=2)
+                        #TODO: remember a window of 16 timesteps with mem gate and out gate
+                        '''
+                        mem_out = self.out_gate(mem_potential)
+                        #cum_mem = torch.sum(mem_out, dim=2, keepdim=True)
+                        #hidden_states = torch.cat((hidden_states, cum_mem +input_states), dim=2)
+
+                        #shift by time step
+                        hidden_states = torch.cat((hidden_states, input_states), dim=2)
+                        expand_dim = hidden_states.shape[2] - mem_out.shape[2]
+                        mem_out = torch.cat((torch.zeros(batch_size,n_heads,expand_dim,dim).to(input_states.device), mem_out),dim=2)
+                        hidden_states = hidden_states+ mem_out
                         #update membrane potential (memory)
                         mem_potential= torch.cat((mem_potential,input_states),dim=2)
                         if mem_potential.shape[2]>16:
+                            mem_potential = mem_potential[:,:,-17:-1,:]
+                        #all 16 mems pass through mem gate again
+                        mem_potential = self.mem_gate(mem_potential)
+                        '''
+                        
+                        #recurrent type 2
+                        #shift by time step
+                        hidden_states = torch.cat((hidden_states, input_states), dim=2)
+                        expand_dim = hidden_states.shape[2] - mem_potential.shape[2]
+                        mem_out = torch.cat((torch.zeros(batch_size,n_heads,expand_dim,dim).to(input_states.device), mem_potential),dim=2)
+                        hidden_states = hidden_states+ mem_out
+                        #update membrane potential (memory)
+                        mem_potential= torch.cat((mem_potential,input_states),dim=2)
+                        if mem_potential.shape[2]>=16:
                             mem_potential = mem_potential[:,:,-16:-1,:]
                         #all 16 mems pass through mem gate again
                         mem_potential = self.mem_gate(mem_potential)
-
-                        
+                        #feb 23 rewrite:
+                        '''
+                        if hidden_states.shape[2]>16:
+                            mem_potential = hidden_states[:,:,-17:-1,:]
+                        else:
+                            mem_potential = hidden_states
+                        #all 16 mems pass through mem gate again
+                        mem_out = self.mem_gate(mem_potential)
+                        #add new input
+                        hidden_states = torch.cat((hidden_states, input_states), dim=2)
+                        if hidden_states.shape[2]>16:
+                            fill_size = hidden_states.shape[2] -16
+                            hidden_states += torch.cat((torch.zeros(batch_size,n_heads,fill_size,dim).to(mem_out.device), mem_out),dim=2)
+                        else:
+                            hidden_states += mem_out
+                        '''
 
 
                     elif self.connect_type==1:
