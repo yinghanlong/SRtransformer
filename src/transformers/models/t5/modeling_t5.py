@@ -426,7 +426,8 @@ class SequenceSpike(torch.autograd.Function):
         bool_select = i_norm > 0.0 #15.0 #mean of norm=11
         count_select =  torch.sum(bool_select,dim=1)
         max_size = torch.max(count_select)
-        select_size = min( max(max_size, int(k_size/4) ), select_size)
+        select_size = max(select_size, max_size)
+        #select_size = min( max(max_size, int(k_size/4) ), select_size)
         #****TOPK*SELECTION, size of idx= b,(n*d), select_size *****# 
         values, select_idx = torch.topk(i_norm, select_size,dim=-1, sorted=False) #F.relu(i_norm- threshold)
 
@@ -513,6 +514,72 @@ class LinearSpike(torch.autograd.Function):
         #grad       = LinearSpike.gamma*F.threshold(1.0-torch.abs(input), 0, 0)
         return grad*grad_input, None
 
+#----linear transformer forward/backward-----#
+class LinearTF(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, query, key, value):
+        ctx.save_for_backward(query, key, value)
+        #compute memory state Z=phi(K)*V
+        batch_size= query.size(0)
+        n_heads= query.size(1)
+        dim= query.size(3)
+
+        attn_output = torch.zeros_like(query).to(query.device)
+        kv_state = torch.zeros(batch_size,n_heads,dim,dim).to(query.device)
+        #set causal mask
+        
+        for qi in range(query.size(2)):    
+            
+            #S = sum_j=1^i (Kj*Vj)
+            kv_state += torch.matmul(
+                key[:,:,:,qi].unsqueeze(3), value[:,:,qi,:].unsqueeze(2) #bndk,bnkd->bndd
+            ) 
+            #COMPUTE similarity for attention
+            attn_o = torch.matmul(query[:,:,qi,:].unsqueeze(2), kv_state) #bn1d
+            attn_output[:,:,qi,:] = attn_o.squeeze(2)
+        return attn_output
+
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        query, key, value  = ctx.saved_tensors
+        q_grad = torch.zeros_like(query).to(query.device)
+        k_grad = torch.zeros_like(key).to(query.device)
+        v_grad = torch.zeros_like(value).to(query.device)
+        batch_size= query.size(0)
+        n_heads= query.size(1)
+        dim= query.size(3)
+        #init
+        grad_input = grad_output.clone() #bnqd
+        s = torch.zeros(batch_size,n_heads,dim,dim).to(query.device)
+        for qi in range(query.size(2)):   
+            #S = sum_j=1^i (Kj*Vj)
+            s += torch.matmul(
+                key[:,:,:,qi].unsqueeze(3), value[:,:,qi,:].unsqueeze(2) #bndk,bnkd->bndd
+            ) 
+            #COMPUTE gradient for Query, dQ= GiS' #TODO: transpose??
+            grad = torch.matmul(grad_input[:,:,qi,:].unsqueeze(2), s.transpose(2,3)) #bn1d*bndd=bn1d
+            q_grad[:,:,qi,:] = grad.squeeze(2)
+        
+        #do not forget to reinit s
+        s = torch.zeros(batch_size,n_heads,dim,dim).to(query.device) 
+        for qi in range(query.size(2)-1,-1,-1): #reversed order   
+            #S = sum_j=1^i (Qi*Gi)
+            s += torch.matmul(
+                query[:,:,qi,:].unsqueeze(3), grad_input[:,:,qi,:].unsqueeze(2) #bnd1,bn1d->bndd
+            ) 
+            #COMPUTE gradient for Query
+            #K grad= S*V
+            grad2 = torch.matmul(s, value[:,:,qi,:].unsqueeze(2).transpose(2,3)) #bndd*bndk=bndk
+            k_grad[:,:,:,qi] = grad2.squeeze(3)
+            #V grad= (S'*K)'=K'*S #TODO: transpose??
+            grad = torch.matmul(key[:,:,:,qi].unsqueeze(3).transpose(2,3), s.transpose(2,3)) #bnkd*bndd=bnkd
+            v_grad[:,:,qi,:] = grad.squeeze(2)
+
+        return q_grad, k_grad, v_grad
+#----------------------#
+
 class T5Attention(nn.Module):
     def __init__(self, config: T5Config, has_relative_attention_bias=False, use_mem=False):
         super().__init__()
@@ -527,13 +594,15 @@ class T5Attention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         self.use_mem = use_mem
-        activate_sparse = True
+        activate_sparse = False #True
         self.key_length =1 #will set when running forward()
         self.real_key_length= 1
         self.sparse = use_mem and activate_sparse
+        self.enable_recur= use_mem and True
         if use_mem==True: #spiking activation
-            self.act_func 	= SequenceSpike.apply #AttentionSpike.apply #SequenceSpike.apply #LinearSpike.apply #TODO: try to use relu
+            self.act_func 	= LinearSpike.apply #AttentionSpike.apply #SequenceSpike.apply #LinearSpike.apply #TODO: try to use relu
             #self.threshold  = Variable(torch.randn(1),requires_grad=True).cuda()
+            self.recur_func= LinearTF.apply
             self.threshold  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
             self.v_threshold  = torch.nn.Parameter( torch.ones(1),requires_grad=True) #different thresholds for key and value
             self.local_connect  =torch.nn.Parameter(torch.randn(4),requires_grad=True)
@@ -666,17 +735,24 @@ class T5Attention(nn.Module):
         if t==0: #initialize spiking neurons
             if self.training:
                 mem_length = seq_length
-                self.key_mem = None
+                self.key_mem = None 
+                self.key_z = torch.zeros(batch_size, self.n_heads,  self.key_value_proj_dim, 1).to(hidden_states.device)
                 self.value_mem = None
             else:
                 mem_length = 1
                 self.value_mem = torch.zeros(batch_size, self.n_heads, 1,self.key_value_proj_dim).to(hidden_states.device)
-                self.key_mem = torch.zeros(batch_size, self.n_heads, 1,self.key_value_proj_dim).to(hidden_states.device)
+                self.key_mem = torch.zeros(batch_size, self.n_heads, 1, self.key_value_proj_dim).to(hidden_states.device)
+                self.key_z = torch.zeros(batch_size, self.n_heads, self.key_value_proj_dim, 1).to(hidden_states.device)
 
             # (batch_size, n_heads, key_length, dim_per_head)
+            #TODO: enable spiking mem
+            
             self.key_states_mem = torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
             self.value_states_mem = torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
+            #***set recurrent states S=KV*****#
+            self.kv_state = torch.zeros(batch_size, self.n_heads,self.key_value_proj_dim,self.key_value_proj_dim).to(hidden_states.device)
             
+
         if past_key_value is not None:
             assert (
                 len(past_key_value) == 2
@@ -822,6 +898,12 @@ class T5Attention(nn.Module):
                         
                         #recurrent type 2
                         #shift by time step
+                        #TODO:only use current hidden states
+                        #hidden_states = input_states 
+                        #mem_out = torch.cat((torch.zeros(batch_size,n_heads,1,dim).to(input_states.device), mem_potential),dim=2)
+                        #hidden_states += torch.sum(mem_out, dim=2,keepdim=True)
+
+                        #concat past hidden states
                         hidden_states = torch.cat((hidden_states, input_states), dim=2)
                         expand_dim = hidden_states.shape[2] - mem_potential.shape[2]
                         mem_out = torch.cat((torch.zeros(batch_size,n_heads,expand_dim,dim).to(input_states.device), mem_potential),dim=2)
@@ -832,6 +914,8 @@ class T5Attention(nn.Module):
                             mem_potential = mem_potential[:,:,-self.window_size:-1,:]
                         #all 16 mems pass through mem gate again
                         mem_potential = self.mem_gate(mem_potential)
+
+
                         #feb 23 rewrite:
                         '''
                         if hidden_states.shape[2]>16:
@@ -897,8 +981,9 @@ class T5Attention(nn.Module):
         #self attention
         if key_value_states is None and self.use_mem==True:
             #TODO: enable IF neurons
-            key_states, self.key_states_mem, self.key_mem = integrate_and_fire(key_states, self.key_states_mem, t, self.key_mem)
-            value_states, self.value_states_mem, self.value_mem = integrate_and_fire(value_states, self.value_states_mem, t, self.value_mem)
+            #if self.enable_recur==True:
+            #    key_states, self.key_states_mem, self.key_mem = integrate_and_fire(key_states, self.key_states_mem, t, self.key_mem)
+            #    value_states, self.value_states_mem, self.value_mem = integrate_and_fire(value_states, self.value_states_mem, t, self.value_mem)
 
             self.threshold.to(key_states.device)
             self.v_threshold.to(key_states.device)
@@ -906,160 +991,248 @@ class T5Attention(nn.Module):
         select_index =None 
         key_select = None
         real_key_length = key_length
-        # compute scores
-        if self.sparse==True: #TODO: convert to sparse matrix
-            '''
-            scores = torch.matmul(
-                query_states, key_states.transpose(3, 2)
-            ) 
-            '''
-            
-            #activate based on norm of each seq location
-            #current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
-            #current_key = current_key.transpose(3,2)
-            #TODO:compare with threshold
-            key_states_th = key_states / self.threshold -1.0
-            key_states_th= key_states_th.transpose(3, 2) #bndk
-            key_states_th= key_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)k
-            key_select, select_index = self.act_func(key_states_th) #b(nd)k->b(nd)s
-            #key_select= torch.cat([key_select, hidden_states], dim=2)
-            key_select= key_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim, -1) 
-            #add the current state on the diag
-            #key_states = torch.cat((key_select,current_key), dim=3)
-            key_length = key_select.shape[3] 
+
+        #-----------------------------#
+        # ----linear transformer
+        #-----------------------------#
+        if self.enable_recur==True:
+
             self.key_length = key_length
             self.real_key_length = real_key_length
-            scores = torch.matmul(
-                query_states, key_select #bnqd,bnsd->bnqs
-            ) 
+
+            #compute memory state Z=phi(K)*V
+            key_states_th = key_states.transpose(3, 2) #bndk
+            #TODO: set phi function, use spiking activation?
+            '''
+            query_th= query_states
             
+            key_states_th = self.act_func(key_states_th/self.threshold - 1.0)
             '''
-            #use maxpooling
-            current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
-            current_key = current_key.transpose(3,2)
-            key_select= key_states.transpose(3, 2) #bndk
-            key_select= key_select.reshape(batch_size,self.inner_dim, -1) #key_length)
-            key_select = F.max_pool1d(key_select, kernel_size=self.window_size, padding=2) #bndk->bnds
-            key_select= key_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
-            #add the current state on the diag
-            key_select = torch.cat((key_select,current_key), dim=3)
-            key_length = key_select.shape[3] #reduced key length
+            key_states_th = torch.nn.functional.elu(key_states_th)+1.0
+            query_th= torch.nn.functional.elu(query_states)+1.0
+            
+            
+            #set position bias
+            if position_bias is None:
+                if not self.has_relative_attention_bias:
+                    position_bias = torch.zeros(
+                        (1, self.n_heads, real_seq_length,1), device=query_states.device, dtype=query_states.dtype
+                    )# (1, self.n_heads, self.key_value_proj_dim, real_key_length)
+                    if self.training and self.gradient_checkpointing:
+                        position_bias.requires_grad = True
+                else:
+                    position_bias = self.compute_bias(real_seq_length,1) #, real_key_length)
+                if past_key_value is not None:
+                    position_bias = position_bias[:, :, -query_th.size(2) :, :]
+            query_th += position_bias
 
-            scores = torch.matmul(
-                query_states, key_select #bnqd,bnsd->bnqs
-            ) 
-            '''
-        else:
-            scores = torch.matmul(
-                query_states, key_states.transpose(3, 2)
-            )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
+            #Compute Q
+            if self.training == True:
+                attn_output = self.recur_func(query_th, key_states_th, value_states)
+                #TODO: add spiking
+                #attn_output = self.act_func(attn_output/self.threshold - 1.0)
 
-        if position_bias is None:
-            if not self.has_relative_attention_bias:
-                position_bias = torch.zeros(
-                    (1, self.n_heads, real_seq_length, real_key_length), device=scores.device, dtype=scores.dtype
-                )
-                if self.training and self.gradient_checkpointing:
-                    position_bias.requires_grad = True
-            else:
-                position_bias = self.compute_bias(real_seq_length, real_key_length)
-
-            # if key and values are already calculated
-            # we want only the last query position bias
-            if past_key_value is not None:
-                position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
-
-            if mask is not None:
-                position_bias = position_bias + mask.to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
+                self.key_z = torch.cumsum(key_states_th, dim=3)
+                qz = torch.zeros(batch_size, self.n_heads, query_th.size(2),1).to(key_states.device) #bnq1
+                for qi in range(query_th.size(2)):
+                    qz[:,:,qi,:]= torch.matmul(query_th[:,:,qi,:].unsqueeze(2),self.key_z[:,:,:,qi].unsqueeze(3)).squeeze(3) #bn1d*bnd1=bn11
+                attn_output = attn_output/ qz # bnqd/bnq1
+            else: #inference
                 
-                #position_bias = position_bias[:,:,:,:key_length] + mask[:,:,:,:key_length].to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
-                #print('Check Mask', mask.shape,mask)
-        
-
-        if self.sparse==True: 
+                self.kv_state += torch.matmul(
+                    key_states_th, value_states #bn1d,bn1d->bndd
+                ) 
+                #COMPUTE similarity for attention
+                attn_output = torch.matmul(query_th, self.kv_state)#bnkd
+                #TODO: add spiking
+                #attn_output = self.act_func(attn_output/self.threshold - 1.0)
+                self.key_z += key_states_th
+                qz= torch.matmul(query_th,self.key_z) 
+                attn_output = attn_output/ qz 
             '''
-            scores += position_bias
-            '''
-            position_bias=  position_bias.reshape(batch_size, self.n_heads*hidden_states.size(1), real_key_length)
-            select_bias = torch.zeros((batch_size, self.n_heads*hidden_states.size(1), key_length), device=scores.device, dtype=scores.dtype)
-            for i in range(batch_size):
-                select_bias[i,:,:] = torch.index_select(position_bias[i,:,:], dim=1, index=select_index[i,:]) 
-            select_bias= select_bias.reshape(batch_size,self.n_heads, hidden_states.size(1), key_length)
-            scores += select_bias
+            #Parallelize
+            self.key_mem = torch.cumsum(key_states_th, dim=-1)
             
+            #compute K*V in parallel
+            #S = sum_j=1^i (Kj*Vj)
+            key_states_th = key_states_th.transpose(3, 2).flatten(1,2) #b(nk)d
+            value_states_th = value_states.flatten(1,2) #b(nk)d
+            kv_states= torch.matmul(
+                key_states_th.unsqueeze(3), value_states_th.unsqueeze(2) #b(nk)d1,b(nk)1d->b(nk)dd
+            ) 
+            kv_states= kv_states.unflatten(1, (self.n_heads, key_length)) #bnkdd
+            kv_states = torch.cumsum(kv_states,dim=2)
+            #COMPUTE similarity for attention
+            for qi in range(hidden_states.size(1)): 
+                attn_o = torch.matmul(query_th[:,:,qi,:].unsqueeze(2), kv_states[:,:,qi,:,:]) #bn1d
+                attn_o = attn_o / torch.matmul(query_th[:,:,qi,:].unsqueeze(2), self.key_mem[:,:,:,qi].unsqueeze(3)) #bn1d/bn11
+                attn_output[:,:,qi,:] = attn_o.squeeze(2)
             '''
-            #maxpooling
-            position_pool = torch.range(0,real_key_length-1,4).long()
-            position_bias = position_bias[:,:,:,position_pool]
-            position_bias = position_bias[:,:,:,:key_length]
-            scores += position_bias
-            #scores += position_bias[:,:,:,:key_length]
-            '''
-        else:
-            scores += position_bias
-        attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
-            scores
-        )  # (batch_size, n_heads, seq_length, key_length)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.dropout, training=self.training
-        )  # (batch_size, n_heads, seq_length, key_length)
-
-        # Mask heads if we want to
-        if layer_head_mask is not None:
-            attn_weights = attn_weights * layer_head_mask
-
-        if self.sparse==True: #TODO: convert to sparse matrix
-            #TODO: reduce length of attention weights from bnqk to bnqs
-            '''
-            attn_weights_th = attn_weights.reshape(batch_size,self.n_heads*hidden_states.size(1), key_length)
-            attn_weights_th = attn_weights_th / self.threshold
-            attn_select, select_index = self.act_func(attn_weights_th)
-            attn_select = attn_select.reshape(batch_size,self.n_heads,hidden_states.size(1), -1)
-            #print(attn_select.shape, attn_weights.shape)
-            self.key_length = attn_select.size(3)
+            
+        #-----------------------------#
+        # Regular computation of attention
+        #-----------------------------#
+        else: 
+            # compute scores
+            self.key_length = key_length
             self.real_key_length = real_key_length
-            '''
+            if self.sparse==True: #TODO: convert to sparse matrix
+                '''
+                scores = torch.matmul(
+                    query_states, key_states.transpose(3, 2)
+                ) 
+                '''
+                
+                #activate based on norm of each seq location
+                #current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
+                #current_key = current_key.transpose(3,2)
+                #TODO:compare with threshold
+                key_states_th = key_states / self.threshold -1.0
+                
+                key_states_th= key_states_th.transpose(3, 2) #bndk
+                key_states_th= key_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)k
+                key_select, select_index = self.act_func(key_states_th) #b(nd)k->b(nd)s
+                #key_select= torch.cat([key_select, hidden_states], dim=2)
+                key_select= key_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim, -1) 
+                #add the current state on the diag
+                #key_states = torch.cat((key_select,current_key), dim=3)
+                key_length = key_select.shape[3] 
+                self.key_length = key_length
+                self.real_key_length = real_key_length
+                scores = torch.matmul(
+                    query_states, key_select #bnqd,bnsd->bnqs
+                ) 
+                
+                '''
+                #use maxpooling
+                current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
+                current_key = current_key.transpose(3,2)
+                key_select= key_states.transpose(3, 2) #bndk
+                key_select= key_select.reshape(batch_size,self.inner_dim, -1) #key_length)
+                key_select = F.max_pool1d(key_select, kernel_size=self.window_size, padding=2) #bndk->bnds
+                key_select= key_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
+                #add the current state on the diag
+                key_select = torch.cat((key_select,current_key), dim=3)
+                key_length = key_select.shape[3] #reduced key length
 
-            #activate based on key states
-            #current_value = value_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
-            #current_value = current_value.transpose(3,2)
+                scores = torch.matmul(
+                    query_states, key_select #bnqd,bnsd->bnqs
+                ) 
+                '''
             
-            value_states_th = value_states #/ self.v_threshold
-            value_states_th= value_states_th.transpose(3, 2) #bnvd->bndv
-            value_states_th= value_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)v
-            #print(value_states_th.shape)
-            #TODO: set length
-            #value_select=torch.zeros((batch_size,self.inner_dim, attn_select.size(3))).to(value_states.device)
-            value_select=torch.zeros((batch_size,self.inner_dim, key_length)).to(value_states.device)
+            else:
+                scores = torch.matmul(
+                    query_states, key_states.transpose(3, 2)
+                )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
 
-            #print(value_select.shape)
-            for i in range(batch_size):
-                #for j in range(self.n_heads):
-                value_select[i,:,:] = torch.index_select(value_states_th[i,:,:], dim=1, index=select_index[i,:])  
-            value_select= value_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
-            #add the current state on the diag
-            #value_states = torch.cat((value_select,current_value), dim=3)
+            if position_bias is None:
+                if not self.has_relative_attention_bias:
+                    position_bias = torch.zeros(
+                        (1, self.n_heads, real_seq_length, real_key_length), device=scores.device, dtype=scores.dtype
+                    )
+                    if self.training and self.gradient_checkpointing:
+                        position_bias.requires_grad = True
+                else:
+                    position_bias = self.compute_bias(real_seq_length, real_key_length)
 
-            #TODO:multiply with selected attention weights
-            attn_output = torch.matmul(attn_weights, value_select.transpose(3, 2)) 
-            #attn_output = torch.matmul(attn_select, value_select.transpose(3, 2)) 
+                # if key and values are already calculated
+                # we want only the last query position bias
+                if past_key_value is not None:
+                    position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
 
-            '''
-            #use maxpooling
-            current_value = value_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
-            current_value = current_value.transpose(3,2)
+                if mask is not None:
+                    position_bias = position_bias + mask.to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
+                    
+                    #position_bias = position_bias[:,:,:,:key_length] + mask[:,:,:,:key_length].to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
+                    #print('Check Mask', mask.shape,mask)
+            
 
-            value_select= value_states.transpose(3, 2) #bnvd->bndv
-            value_select= value_select.reshape(batch_size,self.inner_dim, -1)
-            value_select = F.max_pool1d(value_select, kernel_size=self.window_size, padding=2) #bndv->bnds
-            value_select= value_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
-            #add the current state on the diag
-            value_select = torch.cat((value_select,current_value), dim=3)
-            value_select= value_select.transpose(3, 2) #bnds->bnsd
-            attn_output = torch.matmul(attn_weights, value_select) #(bnqs,bnsd)->(bnqd)
-            '''
-        else:
-            attn_output = torch.matmul(attn_weights, value_states) #(bnqk,bnvd)->(bnqd)
+            if self.sparse==True: 
+                '''
+                scores += position_bias
+                '''
+                position_bias=  position_bias.reshape(batch_size, self.n_heads*hidden_states.size(1), real_key_length)
+                select_bias = torch.zeros((batch_size, self.n_heads*hidden_states.size(1), key_length), device=scores.device, dtype=scores.dtype)
+                for i in range(batch_size):
+                    select_bias[i,:,:] = torch.index_select(position_bias[i,:,:], dim=1, index=select_index[i,:]) 
+                select_bias= select_bias.reshape(batch_size,self.n_heads, hidden_states.size(1), key_length)
+                scores += select_bias
+                
+                '''
+                #maxpooling
+                position_pool = torch.range(0,real_key_length-1,4).long()
+                position_bias = position_bias[:,:,:,position_pool]
+                position_bias = position_bias[:,:,:,:key_length]
+                scores += position_bias
+                #scores += position_bias[:,:,:,:key_length]
+                '''
+            else:
+                scores += position_bias
+            attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
+                scores
+            )  # (batch_size, n_heads, seq_length, key_length)
+            attn_weights = nn.functional.dropout(
+                attn_weights, p=self.dropout, training=self.training
+            )  # (batch_size, n_heads, seq_length, key_length)
+
+            # Mask heads if we want to
+            if layer_head_mask is not None:
+                attn_weights = attn_weights * layer_head_mask
+
+            if self.sparse==True: #TODO: convert to sparse matrix
+                #TODO: reduce length of attention weights from bnqk to bnqs
+                '''
+                attn_weights_th = attn_weights.reshape(batch_size,self.n_heads*hidden_states.size(1), key_length)
+                attn_weights_th = attn_weights_th / self.threshold
+                attn_select, select_index = self.act_func(attn_weights_th)
+                attn_select = attn_select.reshape(batch_size,self.n_heads,hidden_states.size(1), -1)
+                #print(attn_select.shape, attn_weights.shape)
+                self.key_length = attn_select.size(3)
+                self.real_key_length = real_key_length
+                '''
+
+                #activate based on key states
+                #current_value = value_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
+                #current_value = current_value.transpose(3,2)
+                
+                value_states_th = value_states #/ self.v_threshold
+                value_states_th= value_states_th.transpose(3, 2) #bnvd->bndv
+                value_states_th= value_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)v
+                #print(value_states_th.shape)
+                #TODO: set length
+                #value_select=torch.zeros((batch_size,self.inner_dim, attn_select.size(3))).to(value_states.device)
+                value_select=torch.zeros((batch_size,self.inner_dim, key_length)).to(value_states.device)
+
+                #print(value_select.shape)
+                for i in range(batch_size):
+                    #for j in range(self.n_heads):
+                    value_select[i,:,:] = torch.index_select(value_states_th[i,:,:], dim=1, index=select_index[i,:])  
+                value_select= value_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
+                #add the current state on the diag
+                #value_states = torch.cat((value_select,current_value), dim=3)
+
+                #TODO:multiply with selected attention weights
+                attn_output = torch.matmul(attn_weights, value_select.transpose(3, 2)) 
+                #attn_output = torch.matmul(attn_select, value_select.transpose(3, 2)) 
+
+                '''
+                #use maxpooling
+                current_value = value_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
+                current_value = current_value.transpose(3,2)
+
+                value_select= value_states.transpose(3, 2) #bnvd->bndv
+                value_select= value_select.reshape(batch_size,self.inner_dim, -1)
+                value_select = F.max_pool1d(value_select, kernel_size=self.window_size, padding=2) #bndv->bnds
+                value_select= value_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
+                #add the current state on the diag
+                value_select = torch.cat((value_select,current_value), dim=3)
+                value_select= value_select.transpose(3, 2) #bnds->bnsd
+                attn_output = torch.matmul(attn_weights, value_select) #(bnqs,bnsd)->(bnqd)
+                '''
+            else:
+                attn_output = torch.matmul(attn_weights, value_states) #(bnqk,bnvd)->(bnqd)
+
+
         attn_output = unshape(attn_output)  # (batch_size, seq_length, dim)
         attn_output = self.o(attn_output)
 

@@ -48,3 +48,4 @@ python examples/pytorch/summarization/run_summarization_no_trainer.py     --mode
 #note: set use_mem=True, reset, and connect_type
 
 github token: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
+gpustat -up

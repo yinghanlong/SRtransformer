@@ -563,8 +563,10 @@ def main():
     for epoch in range(args.num_train_epochs):
         if use_mem:
             #logger.info(f"Using maxpooling to make attention sparse! Keep current key/values")
-            logger.info(f"Using seq-based threshold activation on keys/thre-1! set k/4<size<2/k. Change min length to 8.  Keep current key/values. Turned off topk sorting")
-            logger.info(f"Connect type={model.module.decoder.block[0].layer[0].SelfAttention.connect_type}, MAX LENGTH=/2")
+            logger.info(f"Implemented backward gradients Using linear transformer, phi(attnout)=ELU, grad K=SV, grad V=S^T*K from N-1 to 0, position bias(q,1),")#position bias size(1,k)
+            #logger.info(f"Using linear transformer, phi(k)=linearspike(x/thre-1.0)")#position bias size(1,k)
+            #logger.info(f"Using seq-based threshold activation on keys/thre-1! thre=0.5. set k/2<size. Change min length to 8.  Keep current key/values. Turned off topk sorting")
+            logger.info(f"no IF, Connect type={model.module.decoder.block[0].layer[0].SelfAttention.connect_type}, MAX LENGTH=/2")
             logger.info(f"Using {model.module.decoder.block[0].layer[0].SelfAttention.window_size} recurrent spiking mem gate!")
         avg_spiking_rate= torch.zeros(12)
         if (args.evaluation_only==False):
@@ -598,7 +600,7 @@ def main():
                         if use_mem==True:
                             #print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
                             print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
-                            print("reduce length to=",model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length)
+                            #print("reduce length to=",model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length)
                             #avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
                 total_steps= step
             #avg_spiking_rate/= total_steps/log_step
@@ -607,7 +609,7 @@ def main():
 
         model.eval()
         logging.info("Evaluating model")
-        eval_time = time.process_time()
+        eval_time = time.time()
         if args.val_max_target_length is None:
             args.val_max_target_length = args.max_target_length
 
@@ -629,7 +631,8 @@ def main():
                 )
                 #calculate average spiking rates
                 if step%eval_log_step==0:
-                    logger.info(f"time to eval {step} steps from start={time.process_time()-eval_time}")
+                    end_time = time.time()
+                    logger.info(f"time to eval {step} steps from start={end_time-eval_time}")
                     for i in range(12):
                         if use_mem==True:
                             logger.info(f"reduce length to={model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length}")
@@ -667,7 +670,8 @@ def main():
         #logger.info(f"average spiking rate={torch.mean(avg_spiking_rate)}")
         for i in range(12):
             logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
-        logger.info(f"eval time={time.process_time()-eval_time}")
+        end_time = time.time()
+        logger.info(f"eval time={end_time-eval_time}")
         result = metric.compute(use_stemmer=True)
         # Extract a few results from ROUGE
         result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
