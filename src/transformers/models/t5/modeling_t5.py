@@ -428,6 +428,8 @@ class SequenceSpike(torch.autograd.Function):
         max_size = torch.max(count_select)
         select_size = max(select_size, max_size)
         #select_size = min( max(max_size, int(k_size/4) ), select_size)
+        #TODO: test full length
+        select_size = k_size
         #****TOPK*SELECTION, size of idx= b,(n*d), select_size *****# 
         values, select_idx = torch.topk(i_norm, select_size,dim=-1, sorted=False) #F.relu(i_norm- threshold)
 
@@ -441,11 +443,12 @@ class SequenceSpike(torch.autograd.Function):
                     select_idx = torch.cat((select_idx,add_idx.to(input.device)), dim=1)
         '''
         #TODO: add current?
-        
+        '''
         current_index = torch.full((batch_size,1), k_size-1)
         current_index.to(select_idx.device)
         select_idx = torch.cat((select_idx,current_index.to(select_idx.device)), dim=1)
-        
+        '''
+
         select_size= select_idx.size(1)
         #select_idx = i_norm>0 #torch.nonzero(i_norm)  #size= (s,3), s=number of nonzeros, 3=number of dim in index
         #print(i_norm.shape, select_idx.shape)
@@ -517,6 +520,7 @@ class LinearSpike(torch.autograd.Function):
 #----linear transformer forward/backward-----#
 class LinearTF(torch.autograd.Function):
 
+    clip_gradient = 1.0 #TODO:avoid gradient exploding
     @staticmethod
     def forward(ctx, query, key, value):
         ctx.save_for_backward(query, key, value)
@@ -528,6 +532,8 @@ class LinearTF(torch.autograd.Function):
         attn_output = torch.zeros_like(query).to(query.device)
         kv_state = torch.zeros(batch_size,n_heads,dim,dim).to(query.device)
         #set causal mask
+
+        
         
         for qi in range(query.size(2)):    
             
@@ -536,8 +542,9 @@ class LinearTF(torch.autograd.Function):
                 key[:,:,:,qi].unsqueeze(3), value[:,:,qi,:].unsqueeze(2) #bndk,bnkd->bndd
             ) 
             #COMPUTE similarity for attention
-            attn_o = torch.matmul(query[:,:,qi,:].unsqueeze(2), kv_state) #bn1d
+            attn_o = torch.matmul(query[:,:,qi,:].unsqueeze(2), kv_state) #bn1d, bndd -> bn1d
             attn_output[:,:,qi,:] = attn_o.squeeze(2)
+        
         return attn_output
 
     
@@ -552,32 +559,55 @@ class LinearTF(torch.autograd.Function):
         dim= query.size(3)
         #init
         grad_input = grad_output.clone() #bnqd
+
+        
         s = torch.zeros(batch_size,n_heads,dim,dim).to(query.device)
         for qi in range(query.size(2)):   
             #S = sum_j=1^i (Kj*Vj)
-            s += torch.matmul(
+            s += LinearTF.clip_gradient * torch.matmul(
                 key[:,:,:,qi].unsqueeze(3), value[:,:,qi,:].unsqueeze(2) #bndk,bnkd->bndd
             ) 
-            #COMPUTE gradient for Query, dQ= GiS' #TODO: transpose??
-            grad = torch.matmul(grad_input[:,:,qi,:].unsqueeze(2), s.transpose(2,3)) #bn1d*bndd=bn1d
+            #COMPUTE gradient for Query, dQ= GiS'= GKV #TODO: transpose??
+            grad = torch.matmul(grad_input[:,:,qi,:].unsqueeze(2), s) #bn1d*bndd=bn1d
             q_grad[:,:,qi,:] = grad.squeeze(2)
         
         #do not forget to reinit s
-        s = torch.zeros(batch_size,n_heads,dim,dim).to(query.device) 
+        qg = torch.zeros(batch_size,n_heads,1,1).to(query.device) 
         for qi in range(query.size(2)-1,-1,-1): #reversed order   
-            #S = sum_j=1^i (Qi*Gi)
-            s += torch.matmul(
-                query[:,:,qi,:].unsqueeze(3), grad_input[:,:,qi,:].unsqueeze(2) #bnd1,bn1d->bndd
+            '''
+            #S = sum_j=N-1^i (Qi*Gi)
+            s += LinearTF.clip_gradient * torch.matmul(
+                query[:,:,qi,:].unsqueeze(2).transpose(2,3), grad_input[:,:,qi,:].unsqueeze(2) #bnd1,bn1d->bndd
             ) 
+            #TODO: transpose??
+            #s= s.transpose(2,3)
             #COMPUTE gradient for Query
-            #K grad= S*V
+            #K grad ' = S*V= QGV = (kd)(dk)(kd)= kd
             grad2 = torch.matmul(s, value[:,:,qi,:].unsqueeze(2).transpose(2,3)) #bndd*bndk=bndk
             k_grad[:,:,:,qi] = grad2.squeeze(3)
-            #V grad= (S'*K)'=K'*S #TODO: transpose??
-            grad = torch.matmul(key[:,:,:,qi].unsqueeze(3).transpose(2,3), s.transpose(2,3)) #bnkd*bndd=bnkd
+            #V grad= (S'*K)'=K'*S = sum (QjKiGj)= (kd)(dk)(kd)= kd, k=1
+            #grad = torch.matmul(key[:,:,:,qi].unsqueeze(3).transpose(2,3), s) #bnkd*bndd=bnkd
+            #TODO: use einsum, qkg
+            #kg += torch.einsum("bnkd, bndk, bnkd-> bnkd", query[:,:,qi,:].unsqueeze(2), key[:,:,:,qi].unsqueeze(3), )
             v_grad[:,:,qi,:] = grad.squeeze(2)
 
+            '''
+            #S = sum_j=N-1^i (Qi*Gi)
+            qgi= torch.matmul(
+                query[:,:,qi,:].unsqueeze(2), grad_input[:,:,qi,:].unsqueeze(2).transpose(2,3) #bn1d,bnd1->bn11
+            ) 
+            
+            qg += LinearTF.clip_gradient * qgi
+            
+            #COMPUTE gradient for Query
+            #K grad ' = S*V= QGV = (kd)(dk)(kd)= kd
+            grad2 = torch.matmul(qg, value[:,:,qi,:].unsqueeze(2)) #bn11*bn1d=bn1d
+            k_grad[:,:,:,qi] = grad2.squeeze(2)
+            #V grad= SK = sum(QjGj) Ki= (kd)(kd)(dk)= kd, k=1
+            grad = torch.matmul(qg, key[:,:,:,qi].unsqueeze(3).transpose(2,3)) #bnkk*bnkd=bnkd
+            v_grad[:,:,qi,:] = grad.squeeze(2)
         return q_grad, k_grad, v_grad
+    
 #----------------------#
 
 class T5Attention(nn.Module):
@@ -594,13 +624,13 @@ class T5Attention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         self.use_mem = use_mem
-        activate_sparse = False #True
+        activate_sparse = False
         self.key_length =1 #will set when running forward()
         self.real_key_length= 1
         self.sparse = use_mem and activate_sparse
         self.enable_recur= use_mem and True
         if use_mem==True: #spiking activation
-            self.act_func 	= LinearSpike.apply #AttentionSpike.apply #SequenceSpike.apply #LinearSpike.apply #TODO: try to use relu
+            self.act_func 	= SequenceSpike.apply #AttentionSpike.apply #SequenceSpike.apply #LinearSpike.apply #TODO: try to use relu
             #self.threshold  = Variable(torch.randn(1),requires_grad=True).cuda()
             self.recur_func= LinearTF.apply
             self.threshold  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
@@ -610,7 +640,7 @@ class T5Attention(nn.Module):
             
             #TODO: set connection types. 0:recurrent, 1:cumulative ,2:direct
             self.connect_type= 0
-            self.window_size= 8 #5 #16
+            self.window_size= 5 #8 #5 #16
             self.enable_reset=False
             self.mem_gate = nn.Linear(self.key_value_proj_dim, self.key_value_proj_dim, bias=False)
             #self.out_gate = nn.Linear(self.key_value_proj_dim, self.key_value_proj_dim, bias=False)
@@ -981,9 +1011,9 @@ class T5Attention(nn.Module):
         #self attention
         if key_value_states is None and self.use_mem==True:
             #TODO: enable IF neurons
-            #if self.enable_recur==True:
-            #    key_states, self.key_states_mem, self.key_mem = integrate_and_fire(key_states, self.key_states_mem, t, self.key_mem)
-            #    value_states, self.value_states_mem, self.value_mem = integrate_and_fire(value_states, self.value_states_mem, t, self.value_mem)
+            #if self.enable_recur==False:
+            key_states, self.key_states_mem, self.key_mem = integrate_and_fire(key_states, self.key_states_mem, t, self.key_mem)
+            value_states, self.value_states_mem, self.value_mem = integrate_and_fire(value_states, self.value_states_mem, t, self.value_mem)
 
             self.threshold.to(key_states.device)
             self.v_threshold.to(key_states.device)
@@ -1003,13 +1033,19 @@ class T5Attention(nn.Module):
             #compute memory state Z=phi(K)*V
             key_states_th = key_states.transpose(3, 2) #bndk
             #TODO: set phi function, use spiking activation?
-            '''
-            query_th= query_states
             
-            key_states_th = self.act_func(key_states_th/self.threshold - 1.0)
-            '''
-            key_states_th = torch.nn.functional.elu(key_states_th)+1.0
-            query_th= torch.nn.functional.elu(query_states)+1.0
+            query_th= query_states
+            #key_states_th = torch.exp(key_states_th)
+            #key_states_th = self.act_func(key_states_th/self.threshold - 1.0)
+            
+            #key_states_th = torch.nn.functional.elu(key_states_th)+1.0
+            #query_th= torch.nn.functional.elu(query_states)+1.0
+            
+            #k_mean = torch.max(key_states_th, dim=3, keepdim=True)[0]
+            #key_t = key_states_th- k_mean
+            #key_exp = torch.exp(key_t.float())
+
+            key_states_th = torch.nn.functional.sigmoid(key_states_th)
             
             
             #set position bias
@@ -1026,21 +1062,75 @@ class T5Attention(nn.Module):
                     position_bias = position_bias[:, :, -query_th.size(2) :, :]
             query_th += position_bias
 
-            #Compute Q
-            if self.training == True:
-                attn_output = self.recur_func(query_th, key_states_th, value_states)
-                #TODO: add spiking
-                #attn_output = self.act_func(attn_output/self.threshold - 1.0)
+            #compute exponential of q for softmax
+            #q_mean = torch.max(query_th, dim=2, keepdim=True)[0]
+            #q_t = query_th- q_mean
+            #query_exp = torch.exp(q_t.float())
+            query_th = torch.nn.functional.sigmoid(query_th)
 
-                self.key_z = torch.cumsum(key_states_th, dim=3)
-                qz = torch.zeros(batch_size, self.n_heads, query_th.size(2),1).to(key_states.device) #bnq1
-                for qi in range(query_th.size(2)):
-                    qz[:,:,qi,:]= torch.matmul(query_th[:,:,qi,:].unsqueeze(2),self.key_z[:,:,:,qi].unsqueeze(3)).squeeze(3) #bn1d*bnd1=bn11
-                attn_output = attn_output/ qz # bnqd/bnq1
+            #Compute Q
+            if self.enable_recur==True:#self.training == True: #TODO: training/infer
+                #attn_output = self.recur_func(query_exp, key_exp, value_states)
+
+                #TODO: compute all, create a lower triangle causal mask for value 
+                
+                scores = torch.matmul(
+                       query_th, key_states_th #bnqd,bndk->bnqk
+                ) 
+
+                #TODO:Maybe not need an explicit mask if using cumsum???
+                if mask is not None:
+                    scores = scores+ mask.to(scores.device)
+                #approx of softmax
+                '''
+                s_mean = torch.max(scores, dim=3, keepdim=True)[0]
+                scores = scores- s_mean
+                s_exp = torch.exp(scores.float())
+                '''
+                #qz = torch.sum(s_exp, dim=3, keepdim=True)
+                #causal masking : cumsum
+                if self.training == True:
+                    self.key_z = torch.cumsum(key_states_th, dim=3) 
+                    qz = torch.diagonal(torch.matmul(query_th,self.key_z), dim1=2, dim2=3) #diag(bnqd*bndk)=bnq1
+                    qz = qz.unsqueeze(3)
+                else:
+                    self.key_z = torch.sum(key_states_th, dim=3, keepdim=True) 
+                    qz = torch.matmul(query_th,self.key_z) #bn1d*bnd1=bn11
+                
+                #qz += 1e-6 #epsilon
+                attn_weights  = scores / qz
+                attn_weights  = attn_weights.type_as(scores)
+
+
+                #TODO:apply softmax
+                #attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(scores)  # (batch_size, n_heads, seq_length, key_length)
+                
+                attn_weights = nn.functional.dropout(
+                    attn_weights, p=self.dropout, training=self.training
+                )  # (batch_size, n_heads, seq_length, key_length)
+
+                # Mask heads if we want to
+                if layer_head_mask is not None:
+                    attn_weights = attn_weights * layer_head_mask
+
+                #Output
+                attn_output = torch.matmul(attn_weights, value_states)
+                
+                '''
+                
+                #qz = torch.zeros(batch_size, self.n_heads, query_th.size(2),1).to(key_states.device) #bnq1
+                #for qi in range(query_th.size(2)):
+                #    qz[:,:,qi,:]= torch.matmul(query_th[:,:,qi,:].unsqueeze(2),self.key_z[:,:,:,qi].unsqueeze(3)).squeeze(3) #bn1d*bnd1=bn11
+
+                self.key_z = torch.cumsum(key_exp, dim=3) 
+                qz = torch.diagonal(torch.matmul(query_exp,self.key_z), dim1=2, dim2=3) #diag(bnqd*bndk)=bnq1
+                qz = qz.unsqueeze(3)
+                attn_output = torch.div(attn_output, qz)  # bnqd/bnq1
+                '''
             else: #inference
                 
                 self.kv_state += torch.matmul(
-                    key_states_th, value_states #bn1d,bn1d->bndd
+                    key_states_th, value_states #bnd1,bn1d->bndd
                 ) 
                 #COMPUTE similarity for attention
                 attn_output = torch.matmul(query_th, self.kv_state)#bnkd
@@ -1048,7 +1138,8 @@ class T5Attention(nn.Module):
                 #attn_output = self.act_func(attn_output/self.threshold - 1.0)
                 self.key_z += key_states_th
                 qz= torch.matmul(query_th,self.key_z) 
-                attn_output = attn_output/ qz 
+                
+                attn_output = torch.div(attn_output, qz) 
             '''
             #Parallelize
             self.key_mem = torch.cumsum(key_states_th, dim=-1)
@@ -1087,7 +1178,7 @@ class T5Attention(nn.Module):
                 #current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
                 #current_key = current_key.transpose(3,2)
                 #TODO:compare with threshold
-                key_states_th = key_states / self.threshold -1.0
+                key_states_th = key_states # / self.threshold -1.0
                 
                 key_states_th= key_states_th.transpose(3, 2) #bndk
                 key_states_th= key_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)k
@@ -1168,6 +1259,7 @@ class T5Attention(nn.Module):
                 '''
             else:
                 scores += position_bias
+
             attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
                 scores
             )  # (batch_size, n_heads, seq_length, key_length)
@@ -1231,6 +1323,7 @@ class T5Attention(nn.Module):
                 '''
             else:
                 attn_output = torch.matmul(attn_weights, value_states) #(bnqk,bnvd)->(bnqd)
+
 
 
         attn_output = unshape(attn_output)  # (batch_size, seq_length, dim)

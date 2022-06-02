@@ -563,10 +563,11 @@ def main():
     for epoch in range(args.num_train_epochs):
         if use_mem:
             #logger.info(f"Using maxpooling to make attention sparse! Keep current key/values")
-            logger.info(f"Implemented backward gradients Using linear transformer, phi(attnout)=ELU, grad K=SV, grad V=S^T*K from N-1 to 0, position bias(q,1),")#position bias size(1,k)
+            logger.info(f"New: phi=sigmoid. compute ((q+position)*(k*v))/z; z=phi(q+position)*sum(phi(key)); train cumsum &infer sum")
+            #logger.info(f"Implemented backward gradients Using linear transformer, phi(attnout)=ELU, grad K=SV, grad V=S*K from N-1 to 0, position bias(q,1), torch.div(attn,qz)")#position bias size(1,k)
             #logger.info(f"Using linear transformer, phi(k)=linearspike(x/thre-1.0)")#position bias size(1,k)
-            #logger.info(f"Using seq-based threshold activation on keys/thre-1! thre=0.5. set k/2<size. Change min length to 8.  Keep current key/values. Turned off topk sorting")
-            logger.info(f"no IF, Connect type={model.module.decoder.block[0].layer[0].SelfAttention.connect_type}, MAX LENGTH=/2")
+            #logger.info(f"Using seq-based activation on keys! set size=K.  Keep current key/values. Turned off topk sorting")
+            logger.info(f"Connect type={model.module.decoder.block[0].layer[0].SelfAttention.connect_type}")
             logger.info(f"Using {model.module.decoder.block[0].layer[0].SelfAttention.window_size} recurrent spiking mem gate!")
         avg_spiking_rate= torch.zeros(12)
         if (args.evaluation_only==False):
@@ -579,10 +580,13 @@ def main():
                 loss = loss / args.gradient_accumulation_steps
                 avg_loss+=loss
                 loss.backward() #accelerator.backward(loss)
-                #for i in range(12):#clipping gradients of threshold
-                #    torch.nn.utils.clip_grad_norm_(model.module.decoder.block[i].layer[0].SelfAttention.threshold, 1.0)
-                #logger.info("Clipping gradients")
+                
+                #TODO: clipping gradients 
                 #torch.nn.utils.clip_grad_norm_(model.module.parameters(), 5.0)
+
+                #for i in range(12):
+                #    torch.nn.utils.clip_grad_norm_(model.module.decoder.block[i].layer[0].SelfAttention.threshold, 1.0)
+                
                 if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                     optimizer.step()
                     lr_scheduler.step()
@@ -633,12 +637,12 @@ def main():
                 if step%eval_log_step==0:
                     end_time = time.time()
                     logger.info(f"time to eval {step} steps from start={end_time-eval_time}")
-                    for i in range(12):
-                        if use_mem==True:
-                            logger.info(f"reduce length to={model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length}")
+                    #for i in range(12):
+                        #if use_mem==True:
+                            #logger.info(f"reduce length to={model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length}")
                          
                             #print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
-                            print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
+                            #print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
                     #if use_mem==True:
                         #avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
 
