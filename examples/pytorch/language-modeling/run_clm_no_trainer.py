@@ -126,7 +126,7 @@ def parse_args():
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
+    parser.add_argument("--num_train_epochs", type=int, default=10, help="Total number of training epochs to perform.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -175,6 +175,14 @@ def parse_args():
     )
     parser.add_argument(
         "--no_keep_linebreaks", action="store_true", help="Do not keep line breaks when using TXT files."
+    )
+    parser.add_argument('--gpus', metavar='DEV_ID', default='0',
+                        help='Comma-separated list of GPU device IDs to be used (default is to use all available devices)')
+    parser.add_argument(
+        "--evaluation_only",
+        type=bool,
+        default=False,
+        help="Do not train the model, only evaluate",
     )
 
     args = parser.parse_args()
@@ -309,6 +317,30 @@ def main():
         model = AutoModelForCausalLM.from_config(config)
 
     model.resize_token_embeddings(len(tokenizer))
+
+    #Set up data parallelism
+    if not torch.cuda.is_available():
+        # Set GPU index to -1 if using CPU
+        args.device = 'cpu'
+        args.gpus = -1
+    else:
+        args.device = 'cuda'
+        if args.gpus is not None:
+            try:
+                args.gpus = [int(s) for s in args.gpus.split(',')]
+            except ValueError:
+                logging.error('ERROR: Argument --gpus must be a comma-separated list of integers only')
+                exit(1)
+            available_gpus = torch.cuda.device_count()
+            for dev_id in args.gpus:
+                if dev_id >= available_gpus:
+                    logging.error('ERROR: GPU device ID {0} requested, but only {1} devices available'
+                                    .format(dev_id, available_gpus))
+                    exit(1)
+            # Set default device in case the first one on the list != 0
+            torch.cuda.set_device(args.gpus[0])
+    model = torch.nn.DataParallel(model, device_ids=args.gpus)
+    model = model.to(args.device)
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -445,28 +477,37 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
 
+    use_cache = True
+    gen_kwargs = {
+        "use_cache": use_cache,
+    }
+    if args.evaluation_only:
+        args.num_train_epochs=1
     for epoch in range(args.num_train_epochs):
-        model.train()
-        for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss = loss / args.gradient_accumulation_steps
-            accelerator.backward(loss)
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                completed_steps += 1
 
-            if completed_steps >= args.max_train_steps:
-                break
+        if (args.evaluation_only==False):
+            model.train()
+            for step, batch in enumerate(train_dataloader):
+                outputs = model(**batch)
+                loss = outputs.loss
+                loss = loss / args.gradient_accumulation_steps
+                accelerator.backward(loss)
+                if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+                    progress_bar.update(1)
+                    completed_steps += 1
+
+                if completed_steps >= args.max_train_steps:
+                    break
 
         model.eval()
         losses = []
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-                outputs = model(**batch)
+                #Set use_cache=True to use previous values
+                outputs = model(**batch, **gen_kwargs)
 
             loss = outputs.loss
             losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))

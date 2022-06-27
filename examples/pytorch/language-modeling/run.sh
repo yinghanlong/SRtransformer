@@ -1,0 +1,1 @@
+python examples/pytorch/language-modeling/run_clm_no_trainer.py     --dataset_name wikitext     --dataset_config_name wikitext-103-raw-v1     --model_name_or_path gpt2     --output_dir ./results/causal-lm/ --gpus=3

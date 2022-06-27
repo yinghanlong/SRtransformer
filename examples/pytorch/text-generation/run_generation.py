@@ -212,7 +212,7 @@ def main():
     except KeyError:
         raise KeyError("the model {} you specified is not supported. You are welcome to add it and open a PR :)")
 
-    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
+    tokenizer = tokenizer_class.from_pretrained("gpt2")
     model = model_class.from_pretrained(args.model_name_or_path)
     model.to(args.device)
 

@@ -24,6 +24,8 @@ import math
 import os
 import random
 
+from datetime import datetime
+
 import datasets
 import numpy as np
 import torch
@@ -54,6 +56,7 @@ from transformers.utils.versions import require_version
 logger = logging.getLogger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/translation/requirements.txt")
 
+date= datetime.now().strftime('%Y-%m-%d-%H-%M')
 # You should update this to your particular problem to have better documentation of `model_type`
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -203,7 +206,7 @@ def parse_args():
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
+    parser.add_argument("--num_train_epochs", type=int, default=10, help="Total number of training epochs to perform.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -213,7 +216,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=10,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
@@ -235,6 +238,15 @@ def parse_args():
         help="Model type to use if training from scratch.",
         choices=MODEL_TYPES,
     )
+    parser.add_argument('--gpus', metavar='DEV_ID', default='0',
+                        help='Comma-separated list of GPU device IDs to be used (default is to use all available devices)')
+    parser.add_argument(
+        "--evaluation_only",
+        type=bool,
+        default=False,
+        help="Do not train the model, only evaluate",
+    )
+
 
     args = parser.parse_args()
 
@@ -249,7 +261,7 @@ def parse_args():
     if args.validation_file is not None:
         extension = args.validation_file.split(".")[-1]
         assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
-
+    args.output_dir+=date+"/" 
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
     return args
@@ -264,6 +276,8 @@ def main():
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
+        filename=args.output_dir+'results.log', #save to a log file
+        filemode='a',
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
@@ -451,6 +465,29 @@ def main():
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
+    #Set up data parallelism
+    if not torch.cuda.is_available():
+        # Set GPU index to -1 if using CPU
+        args.device = 'cpu'
+        args.gpus = -1
+    else:
+        args.device = 'cuda'
+        if args.gpus is not None:
+            try:
+                args.gpus = [int(s) for s in args.gpus.split(',')]
+            except ValueError:
+                logging.error('ERROR: Argument --gpus must be a comma-separated list of integers only')
+                exit(1)
+            available_gpus = torch.cuda.device_count()
+            for dev_id in args.gpus:
+                if dev_id >= available_gpus:
+                    logging.error('ERROR: GPU device ID {0} requested, but only {1} devices available'
+                                    .format(dev_id, available_gpus))
+                    exit(1)
+            # Set default device in case the first one on the list != 0
+            torch.cuda.set_device(args.gpus[0])
+    model = torch.nn.DataParallel(model, device_ids=args.gpus)
+    model = model.to(args.device)
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader
@@ -491,35 +528,52 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"Using a mem network with 3 linear layers and tanh  before proj layers for keys/values")
+            
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
+    log_step = 200
 
+    if args.evaluation_only:
+        args.num_train_epochs=1
     for epoch in range(args.num_train_epochs):
-        model.train()
-        for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss = loss / args.gradient_accumulation_steps
-            accelerator.backward(loss)
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                completed_steps += 1
+        avg_loss = 0.0
+        loss_steps = 0
+        if (args.evaluation_only==False):
+            model.train()
+            for step, batch in enumerate(train_dataloader):
+                outputs = model(**batch)
+                loss = outputs.loss
+                loss = loss / args.gradient_accumulation_steps
+                accelerator.backward(loss)
+                if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+                    progress_bar.update(1)
+                    completed_steps += 1
+                    avg_loss+=loss
+                    loss_steps+=1
+                
+                if step%log_step==0:
+                    print("loss=", loss)
 
-            if completed_steps >= args.max_train_steps:
-                break
+                if completed_steps >= args.max_train_steps:
+                    break
 
+            logger.info(f"Epoch {epoch}, Avg Loss={avg_loss/loss_steps}")
         model.eval()
 
         if args.val_max_target_length is None:
             args.val_max_target_length = args.max_target_length
 
+        use_cache = True
         gen_kwargs = {
             "max_length": args.val_max_target_length if args is not None else config.max_length,
             "num_beams": args.num_beams,
+            #TODO: use cache
+            "use_cache": use_cache,
         }
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
@@ -553,10 +607,10 @@ def main():
         eval_metric = metric.compute()
         logger.info({"bleu": eval_metric["score"]})
 
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+        if args.output_dir is not None:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
 
 
 if __name__ == "__main__":

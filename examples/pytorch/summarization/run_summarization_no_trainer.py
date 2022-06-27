@@ -556,20 +556,22 @@ def main():
     if args.evaluation_only:
         args.num_train_epochs=1
 
-    log_step= 500
+    log_step= 200
     eval_log_step= 100
     use_mem = True #TODO: set to true for spiking networks
     
     for epoch in range(args.num_train_epochs):
         if use_mem:
+            logger.info(f"Using a mem network with 3 linear layers and tanh  before proj layers for keys/values")
+            #logger.info(f"Using separate mem gates after proj layers for keys/values")
             #logger.info(f"Using maxpooling to make attention sparse! Keep current key/values")
-            logger.info(f"New: phi=sigmoid. compute ((q+position)*(k*v))/z; z=phi(q+position)*sum(phi(key)); train cumsum &infer sum")
+            #logger.info(f"New:  scores= q_exp*k_exp, k_exp=exp(k-mean), q_exp=exp(q-mean),  compute (q_exp+position)*k_exp)*v/sum(k_exp)*(q_exp+position)")
             #logger.info(f"Implemented backward gradients Using linear transformer, phi(attnout)=ELU, grad K=SV, grad V=S*K from N-1 to 0, position bias(q,1), torch.div(attn,qz)")#position bias size(1,k)
             #logger.info(f"Using linear transformer, phi(k)=linearspike(x/thre-1.0)")#position bias size(1,k)
-            #logger.info(f"Using seq-based activation on keys! set size=K.  Keep current key/values. Turned off topk sorting")
+            #logger.info(f"Using seq-based sparse activation on keys! set size>=K/2.  Keep current key/values. Turned off topk sorting")
             logger.info(f"Connect type={model.module.decoder.block[0].layer[0].SelfAttention.connect_type}")
             logger.info(f"Using {model.module.decoder.block[0].layer[0].SelfAttention.window_size} recurrent spiking mem gate!")
-        avg_spiking_rate= torch.zeros(12)
+        avg_spiking_rate= torch.zeros(config.num_layers)
         if (args.evaluation_only==False):
             model.train()
             total_steps=0
@@ -584,7 +586,7 @@ def main():
                 #TODO: clipping gradients 
                 #torch.nn.utils.clip_grad_norm_(model.module.parameters(), 5.0)
 
-                #for i in range(12):
+                #for i in range(config.num_layers):
                 #    torch.nn.utils.clip_grad_norm_(model.module.decoder.block[i].layer[0].SelfAttention.threshold, 1.0)
                 
                 if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
@@ -599,11 +601,11 @@ def main():
                 #calculate average spiking rates
 
                 if step%log_step==1:
-                    for i in range(12):
+                    for i in range(config.num_layers):
                         print('loss ', loss)
-                        if use_mem==True:
+                        #if use_mem==True:
                             #print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
-                            print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
+                            #print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
                             #print("reduce length to=",model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length)
                             #avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
                 total_steps= step
@@ -624,7 +626,7 @@ def main():
             "num_beams": args.num_beams,
             "use_cache": use_cache,
         }
-        avg_spiking_rate= torch.zeros(12)
+        avg_spiking_rate= torch.zeros(config.num_layers)
         total_steps=0
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
@@ -636,13 +638,13 @@ def main():
                 #calculate average spiking rates
                 if step%eval_log_step==0:
                     end_time = time.time()
-                    logger.info(f"time to eval {step} steps from start={end_time-eval_time}")
-                    #for i in range(12):
-                        #if use_mem==True:
+                    #logger.info(f"time to eval {step} steps from start={end_time-eval_time}")
+                    for i in range(config.num_layers):
+                        if use_mem==True:
                             #logger.info(f"reduce length to={model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length}")
                          
                             #print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
-                            #print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
+                            print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
                     #if use_mem==True:
                         #avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
 
@@ -672,7 +674,7 @@ def main():
         #avg_spiking_rate/=total_steps
         #logger.info(f"average spiking rate={avg_spiking_rate}")
         #logger.info(f"average spiking rate={torch.mean(avg_spiking_rate)}")
-        for i in range(12):
+        for i in range(config.num_layers):
             logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
         end_time = time.time()
         logger.info(f"eval time={end_time-eval_time}")
