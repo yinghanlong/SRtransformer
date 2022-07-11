@@ -216,7 +216,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=10,
+        default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
@@ -528,18 +528,25 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    logger.info(f"Using a mem network with 3 linear layers and tanh  before proj layers for keys/values")
+    logger.info(f"***Use spiking threshold. Q is not changed. Using a mem network with ONLY ONE linear layers and tanh  before proj layers for keys/values")
             
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
     log_step = 200
+    eval_log_step = 200
 
     if args.evaluation_only:
         args.num_train_epochs=1
+    avg_spiking_rate= torch.zeros(config.num_layers)
+
     for epoch in range(args.num_train_epochs):
         avg_loss = 0.0
         loss_steps = 0
+
+        total_steps=0
+        for i in range(config.num_layers):
+            logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
         if (args.evaluation_only==False):
             model.train()
             for step, batch in enumerate(train_dataloader):
@@ -575,6 +582,7 @@ def main():
             #TODO: use cache
             "use_cache": use_cache,
         }
+        avg_spiking_rate= torch.zeros(config.num_layers)
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 generated_tokens = accelerator.unwrap_model(model).generate(
@@ -604,8 +612,23 @@ def main():
                 decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
                 metric.add_batch(predictions=decoded_preds, references=decoded_labels)
+
+                                #calculate average spiking rates
+                if step%eval_log_step==0:
+                    for i in range(config.num_layers):
+                        print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
+                        avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
+
+                total_steps= step
+
         eval_metric = metric.compute()
         logger.info({"bleu": eval_metric["score"]})
+
+        avg_spiking_rate/=total_steps
+        logger.info(f"average spiking rate={avg_spiking_rate}")
+        #logger.info(f"average spiking rate={torch.mean(avg_spiking_rate)}")
+        for i in range(config.num_layers):
+            logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
 
         if args.output_dir is not None:
             accelerator.wait_for_everyone()

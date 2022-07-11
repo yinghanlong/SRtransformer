@@ -47,7 +47,7 @@ source env/bin/activate
 python examples/pytorch/summarization/run_summarization_no_trainer.py     --model_name_or_path ./results/t5-base/direct-connect/pytorch_model.bin      --config_name ./results/t5-base/direct-connect/config.json   --dataset_name cnn_dailymail     --dataset_config "3.0.0"              --source_prefix "summarize: "     --output_dir ./results/t5-base/     --per_device_train_batch_size=8     --per_device_eval_batch_size=8     --num_train_epochs=10 --tokenizer_name=t5-base  --gpus=3 
 #note: set use_mem=True, reset, and connect_type
 
-github token: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
+github token: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
 gpustat -up
 
 python examples/pytorch/summarization/run_summarization_no_trainer.py  \
@@ -55,3 +55,5 @@ python examples/pytorch/summarization/run_summarization_no_trainer.py  \
    --dataset_name cnn_dailymail     --dataset_config "3.0.0"  \
  --source_prefix "summarize: "     --output_dir ./results/t5-small/     --per_device_train_batch_size=16     --per_device_eval_batch_size=16     --num_train_epochs=10 \
  --gpus =2
+
+python examples/pytorch/summarization/run_summarization_no_trainer.py     --model_name_or_path ./results/t5-small/2022-06-30-15-11/pytorch_model.bin  --config_name ./results/t5-small/2022-06-30-15-11/config.json --tokenizer_name=t5-small --dataset_name cnn_dailymail     --dataset_config "3.0.0"   --source_prefix "summarize: "     --output_dir ./results/t5-small/     --per_device_train_batch_size=16     --per_device_eval_batch_size=16     --num_train_epochs=10  --gpus=1 --evaluation_only=True

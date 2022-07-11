@@ -616,8 +616,8 @@ class MemNetwork(nn.Module):
     def __init__(self, dim):        
         super().__init__()
         self.inner_dim = dim
-        self.input_gate = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
-        self.hidden_gate = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+        self.input_gate = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
+        self.hidden_gate = nn.Linear(self.inner_dim, self.inner_dim, bias=True)
         self.out_gate = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
         self.tanh= nn.Tanh()
     def forward(
@@ -653,11 +653,10 @@ class T5Attention(nn.Module):
         self.sparse = use_mem and activate_sparse
         self.enable_recur= use_mem and False
         if use_mem==True: #spiking activation
-            self.act_func 	= LinearSpike.apply #AttentionSpike.apply #SequenceSpike.apply #LinearSpike.apply #TODO: try to use relu
+            self.act_func 	= SequenceSpike.apply #AttentionSpike.apply #SequenceSpike.apply #LinearSpike.apply #TODO: try to use relu
             #self.threshold  = Variable(torch.randn(1),requires_grad=True).cuda()
             self.recur_func= LinearTF.apply
-            self.threshold  = torch.nn.Parameter( 0.1*torch.ones(1,1,self.inner_dim),requires_grad=True)
-            #self.threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
+            self.threshold  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
             self.v_threshold  = torch.nn.Parameter( torch.ones(1),requires_grad=True) #different thresholds for key and value
             self.local_connect  =torch.nn.Parameter(torch.randn(4),requires_grad=True)
             
@@ -883,18 +882,14 @@ class T5Attention(nn.Module):
                     hidden_states = hidden_states + mem_gate_out
                     '''
                     #TODO:recurrent mem
-                    cum_mem = torch.zeros_like(input_states)
-                    mem_in = input_states
+                    
+                    mem_gate_out = input_states
                     #hidden_states = input_states #torch.zeros_like(input_states).cuda()
                     for ti in range(1,self.window_size):
-                        mem_gate_out = mem_gate(mem_in) #self.mem_gate(mem_gate_out)
-                        mem_gate_out = torch.tanh(mem_gate_out)
-                        mem_gate_out= torch.cat((torch.zeros(batch_size,n_heads,1,dim).to(mem_gate_out.device), mem_gate_out[:,:,:-1,:]),dim=2)
-                        
-                        #mem_gate_out= torch.cat((torch.zeros(batch_size,n_heads,ti,dim).to(mem_gate_out.device), mem_gate_out[:,:,:-ti,:]),dim=2)
-                        cum_mem += mem_gate_out
-                        mem_in = mem_gate_out
-                    hidden_states = hidden_states +cum_mem
+                        mem_gate_out = mem_gate(hidden_states) #self.mem_gate(mem_gate_out)
+                        mem_gate_out= torch.cat((torch.zeros(batch_size,n_heads,ti,dim).to(mem_gate_out.device), mem_gate_out[:,:,:-ti,:]),dim=2)
+                        hidden_states += mem_gate_out
+                    
                     #recurrent mem + out gates
                     '''
                     hidden_mem = input_states
@@ -937,24 +932,45 @@ class T5Attention(nn.Module):
                 #mem_thr 		= (hidden_states[:,:,:t+1,:]/self.threshold) - 1.0 
                 if t==0:
                     hidden_states = input_states #+ self.out_gate(input_states)
-                    mem_potential = mem_gate(input_states)
-                    mem_potential = torch.tanh(mem_potential)
+                    mem_potential = self.mem_gate(input_states)
                 else:
                     if self.connect_type==0:
+                        #current_state = torch.unsqueeze(hidden_states[:,:,-1,:],dim=2)
+
+                        #TODO: add a memory gate
+                        #current_state= self.mem_gate(current_state)
+                        '''
+                        #mem_potential= mem_potential + self.mem_gate(input_states)
+                        hidden_states = torch.cat((hidden_states, mem_potential+input_states), dim=2)
+                        mem_potential= mem_potential + self.mem_gate(input_states)
+                        '''
+
+                        #TODO: remember a window of 16 timesteps with mem gate and out gate
+                        '''
+                        mem_out = self.out_gate(mem_potential)
+                        #cum_mem = torch.sum(mem_out, dim=2, keepdim=True)
+                        #hidden_states = torch.cat((hidden_states, cum_mem +input_states), dim=2)
 
                         #shift by time step
                         hidden_states = torch.cat((hidden_states, input_states), dim=2)
-                        expand_dim = hidden_states.shape[2] - mem_potential.shape[2]
-                        mem_out = torch.cat((torch.zeros(batch_size,n_heads,expand_dim,dim).to(input_states.device), mem_potential),dim=2)
+                        expand_dim = hidden_states.shape[2] - mem_out.shape[2]
+                        mem_out = torch.cat((torch.zeros(batch_size,n_heads,expand_dim,dim).to(input_states.device), mem_out),dim=2)
                         hidden_states = hidden_states+ mem_out
                         #update membrane potential (memory)
                         mem_potential= torch.cat((mem_potential,input_states),dim=2)
-                        if mem_potential.shape[2]>self.window_size:
-                            mem_potential = mem_potential[:,:,-self.window_size:-1,:]
+                        if mem_potential.shape[2]>16:
+                            mem_potential = mem_potential[:,:,-17:-1,:]
                         #all 16 mems pass through mem gate again
-                        mem_potential = mem_gate(mem_potential)
-                        mem_potential = torch.tanh(mem_potential)
+                        mem_potential = self.mem_gate(mem_potential)
                         '''
+                        
+                        #recurrent type 2
+                        #shift by time step
+                        #TODO:only use current hidden states
+                        #hidden_states = input_states 
+                        #mem_out = torch.cat((torch.zeros(batch_size,n_heads,1,dim).to(input_states.device), mem_potential),dim=2)
+                        #hidden_states += torch.sum(mem_out, dim=2,keepdim=True)
+
                         #concat past hidden states
                         mem_out = torch.sum(mem_potential, dim=2, keepdim=True)
                         mem_out = input_states+ mem_out
@@ -964,10 +980,28 @@ class T5Attention(nn.Module):
                             mem_potential = mem_potential[:,:,-self.window_size:-1,:]
                         #all 16 mems pass through mem gate again
                         mem_potential = mem_gate(mem_potential)
-                        mem_potential = torch.tanh(mem_potential)
 
                         hidden_states = torch.cat((hidden_states, mem_out), dim=2)
+
+
+                        #feb 23 rewrite:
                         '''
+                        if hidden_states.shape[2]>16:
+                            mem_potential = hidden_states[:,:,-17:-1,:]
+                        else:
+                            mem_potential = hidden_states
+                        #all 16 mems pass through mem gate again
+                        mem_out = self.mem_gate(mem_potential)
+                        #add new input
+                        hidden_states = torch.cat((hidden_states, input_states), dim=2)
+                        if hidden_states.shape[2]>16:
+                            fill_size = hidden_states.shape[2] -16
+                            hidden_states += torch.cat((torch.zeros(batch_size,n_heads,fill_size,dim).to(mem_out.device), mem_out),dim=2)
+                        else:
+                            hidden_states += mem_out
+                        '''
+
+
                     elif self.connect_type==1:
                         for c in range(4):
                             intermediate= input_states*self.local_connect[c]
@@ -984,7 +1018,7 @@ class T5Attention(nn.Module):
                 #out 			= self.act_func(mem_thr)
                 
                 #****tanh activation*****#
-                out =hidden_states
+                out =torch.tanh(hidden_states)
                 
                 #TODO: reset
                 if self.enable_reset==True:
@@ -997,7 +1031,7 @@ class T5Attention(nn.Module):
             #self.mem[l] 	= self.leak*self.mem[l] + input_states - rst
             return out, hidden_states, mem_potential
 
-        def recurrent_apply(input_states, hidden, t, mem_in=None, mem_h=None):
+        def recurrent_apply(input_states, hidden, t, mem_potential=None, mem_h=None):
             # (batch_size, seq_length, dim)
             batch_size = hidden.shape[0]
             key_len =hidden.shape[1]
@@ -1006,35 +1040,22 @@ class T5Attention(nn.Module):
             if self.training==True:
                 #TODO: add a memory gate
                 hidden = input_states
-                mem_gate_in = input_states
+                mem_gate_out = input_states
                 cum_mem = torch.zeros_like(input_states).cuda()
                 mem_h = torch.zeros_like(input_states).cuda()
-                mem_potential =None
-                spiking_rate=0.0
                 for ti in range(1,self.window_size):
                     #mem_gate_out, mem_h = self.mem_gate(mem_gate_out, mem_h) 
-                    mem_gate_out= self.mem_gate(mem_gate_in)
-                    #mem_gate_out = torch.tanh(mem_gate_out)
-                    #TODO: apply spiking activation
-                    mem_thr 		= torch.div(mem_gate_out,self.threshold) - 1.0 
-                    mem_gate_in			= self.act_func(mem_thr)
-                    spiking_rate += torch.count_nonzero(mem_gate_in)/(mem_gate_in.shape[0]*mem_gate_in.shape[1]*mem_gate_in.shape[2])
-                    #print('spiking count=', spiking_rate)
-                    mem_gate_in= torch.cat((torch.zeros(batch_size,1,dim).to(mem_gate_in.device), mem_gate_in[:,:-1,:]),dim=1)
-                    
-                    #mem_gate_in= torch.cat((torch.zeros(batch_size,ti,dim).to(mem_gate_in.device), mem_gate_in[:,:-ti,:]),dim=1)
-                    cum_mem += mem_gate_in
-                #TODO: try forgetting instead of accumulation
-                #hidden = hidden - cum_mem
+                    mem_gate_out= self.mem_gate(mem_gate_out)
+                    mem_gate_out = torch.tanh(mem_gate_out)
+                    mem_gate_out= torch.cat((torch.zeros(batch_size,ti,dim).to(mem_gate_out.device), mem_gate_out[:,:-ti,:]),dim=1)
+                    cum_mem += mem_gate_out
                 hidden = hidden + cum_mem
-                self.spiking_rate= spiking_rate/self.window_size
+
             else:
                 if t==0:
                     
                     hidden = input_states #+ self.out_gate(input_states)
-                    mem_out = self.mem_gate(input_states)
-                    mem_thr 		= (mem_out/self.threshold) - 1.0 
-                    mem_potential			= self.act_func(mem_thr)
+                    mem_potential = self.mem_gate(input_states)
                     '''
                     mem_h = torch.zeros_like(input_states)
                     mem_potential, mem_h = self.mem_gate(input_states, mem_h)
@@ -1042,24 +1063,15 @@ class T5Attention(nn.Module):
                 else:
                     #current_state = torch.unsqueeze(hidden_states[:,:,-1,:],dim=2)
                     hidden = input_states
-                    mem_sum =  torch.sum(mem_in,dim=1, keepdim=True)
-                    #TODO: try forgetting instead of accumulation
-                    #hidden = hidden - mem_sum
+                    mem_sum =  torch.sum(mem_potential,dim=1, keepdim=True)
                     hidden = hidden + mem_sum
                     #update membrane potential (memory)
-                    mem_in= torch.cat((mem_in,input_states),dim=1)
+                    mem_potential= torch.cat((mem_potential,input_states),dim=1)
                     
-                    if mem_in.shape[1]>=self.window_size:
-                        mem_in = mem_in[:,-self.window_size:-1,:]
-                    mem_out= self.mem_gate(mem_in)
-                    #mem_potential = torch.tanh(mem_potential)
-                    #TODO: apply spiking activation
-                    mem_thr 		= torch.div(mem_out, self.threshold) - 1.0 
-                    mem_potential			= self.act_func(mem_thr)
-                    self.spiking_rate = torch.count_nonzero(mem_potential)/(mem_potential.shape[0]*mem_potential.shape[1]*mem_potential.shape[2])
-                    #print('spiking rate=',self.spiking_rate, ',shape=', mem_potential.shape)
-                    #print('threshold,mem_out mean,max,min', self.threshold, torch.mean(mem_out),torch.max(mem_out),torch.min(mem_out))
-                    #print('mem_potential mean,max,min', torch.mean(mem_potential),torch.max(mem_potential),torch.min(mem_potential))
+                    if mem_potential.shape[1]>=self.window_size:
+                        mem_potential = mem_potential[:,-self.window_size:-1,:]
+                    mem_potential= self.mem_gate(mem_potential)
+                    mem_potential = torch.tanh(mem_potential)
                     '''
                     tmp_zero = torch.zeros_like(input_states)
                     mem_h= torch.cat((mem_h,tmp_zero),dim=1)
@@ -1069,6 +1081,7 @@ class T5Attention(nn.Module):
                     #all 16 mems pass through mem gate again
                     mem_potential, mem_h = self.mem_gate(mem_potential, mem_h)
                     '''
+            #****tanh activation*****#
             out = hidden 
             
             #TODO:spiking activation
@@ -1079,14 +1092,14 @@ class T5Attention(nn.Module):
             return out, hidden, mem_potential, mem_h
 
         #TODO: add recurrent gate before proj layers
-        q_hidden_states = torch.clone(hidden_states)
+        
         if self.use_mem==True:
             #batch, seq, dim
             hidden_states, self.hidden_states_mem, self.hidden_mem, self.mem_h = recurrent_apply(hidden_states, self.hidden_states_mem,t, self.hidden_mem, self.mem_h)
-            hidden_states, self.recur_mem = self.recurrent(hidden_states, self.recur_mem)
+            #hidden_states, self.recur_mem = self.recurrent(hidden_states, self.recur_mem)
         
         # get query states
-        query_states = shape(self.q(q_hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
+        query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
 
         # get key/value states
         key_states = project(
@@ -1096,7 +1109,7 @@ class T5Attention(nn.Module):
             hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
         )
 
-        #print qkv shape
+        #TODO: add spiking integrate-and-fire neurons as memory for self attention
         #if key_value_states is None:
         #    print('self attention size',query_states.shape, key_states.shape, value_states.shape)
         #else:
@@ -1116,129 +1129,324 @@ class T5Attention(nn.Module):
         key_select = None
         real_key_length = key_length
 
-    
+        #-----------------------------#
+        # ----linear transformer
+        #-----------------------------#
+        if self.enable_recur==True:
+
+            self.key_length = key_length
+            self.real_key_length = real_key_length
+
+            #compute memory state Z=phi(K)*V
+            key_states_th = key_states.transpose(3, 2) #bndk
+            #TODO: set phi function, use spiking activation?
+            
+            query_th= query_states
+            #key_states_th = torch.exp(key_states_th)
+            #key_states_th = self.act_func(key_states_th/self.threshold - 1.0)
+            
+            #key_states_th = torch.nn.functional.elu(key_states_th)+1.0
+            #query_th= torch.nn.functional.elu(query_states)+1.0
+
+            #key_states_th = torch.nn.functional.sigmoid(key_states_th)
+            
+            
+            #set position bias
+            if position_bias is None:
+                if not self.has_relative_attention_bias:
+                    position_bias = torch.zeros(
+                        (1, self.n_heads, real_seq_length,1), device=query_states.device, dtype=query_states.dtype
+                    )# (1, self.n_heads, self.key_value_proj_dim, real_key_length)
+                    if self.training and self.gradient_checkpointing:
+                        position_bias.requires_grad = True
+                else:
+                    position_bias = self.compute_bias(real_seq_length,1) #, real_key_length)
+                if past_key_value is not None:
+                    position_bias = position_bias[:, :, -query_th.size(2) :, :]
+            query_th += position_bias
+            #query_exp = query_exp + position_bias
+
+            #compute exponential of k/q for softmax
+            '''
+            if self.training ==True:
+                k_max = torch.max(key_states_th, dim=3, keepdim=True)[0]
+            else: #running max
+                if self.k_max == None: #t==0, cannot subtract max because it will be all zeros
+                    k_max = torch.max(key_states_th)
+                else:
+                    k_max = torch.max(key_states_th, dim=3, keepdim=True)[0]
+            '''
+            q_mean = torch.mean(query_th)
+            q_t = query_th- q_mean
+            query_exp = torch.exp(q_t.float())
+            k_max = torch.mean(key_states_th, dim=3, keepdim=True)
+            key_t = key_states_th- k_max
+            
+            key_exp = torch.exp(key_t.float())
+
+            #query_th = torch.nn.functional.sigmoid(query_th)
+
+
+            #Compute Q
+            if self.enable_recur==True:#self.training == True: #TODO: training/infer
+                #attn_output = self.recur_func(query_exp, key_exp, value_states)
+
+                #TODO: compute all, create a lower triangle causal mask for value 
+                scores = torch.matmul(
+                       query_exp, key_exp #bnqd,bndk->bnqk
+                       #query_th, key_states_th #bnqd,bndk->bnqk
+                ) 
+
+                #TODO:Maybe not need an explicit mask if using cumsum???
+                if mask is not None:
+                    scores = scores+ mask.to(scores.device)
+                #approx of softmax
+                #s_mean = torch.max(scores, dim=3, keepdim=True)[0] #bnd1
+                #scores = scores- s_mean
+                #s_exp = torch.exp(scores.float())
+                
+                #qz = torch.sum(s_exp, dim=3, keepdim=True)
+                #causal masking : cumsum
+                #if self.training == True:
+                #    self.key_z = torch.cumsum(key_exp, dim=3) 
+                #    qz = torch.diagonal(torch.matmul(query_exp,self.key_z), dim1=2, dim2=3) #diag(bnqd*bndk)=bnq1
+                #    qz = qz.unsqueeze(3)
+                #else:
+                self.key_z = torch.sum(key_exp, dim=3, keepdim=True) 
+                qz = torch.matmul(query_exp,self.key_z) #bnqd*bnd1=bnq1
+            
+                #TODO: COMPARE real sum of s_exp and qz
+                #qz = torch.sum(s_exp, dim=3, keepdim=True)
+                #compare_s = qz/sum_s
+                #print('qz/sum_s', torch.mean(compare_s),torch.max(compare_s),torch.min(compare_s))
+                #qz += 1e-6 #epsilon
+
+                #TODO: approximate the denominator of softmax
+                #qz = qz * self.v_threshold
+                attn_weights  = scores/ qz
+                attn_weights  = attn_weights.type_as(scores)
+
+                #TODO:apply softmax
+                #attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(scores)  # (batch_size, n_heads, seq_length, key_length)
+                
+                attn_weights = nn.functional.dropout(
+                    attn_weights, p=self.dropout, training=self.training
+                )  # (batch_size, n_heads, seq_length, key_length)
+
+                # Mask heads if we want to
+                if layer_head_mask is not None:
+                    attn_weights = attn_weights * layer_head_mask
+
+                #Output
+                attn_output = torch.matmul(attn_weights, value_states)
+                
+                '''
+                
+                #qz = torch.zeros(batch_size, self.n_heads, query_th.size(2),1).to(key_states.device) #bnq1
+                #for qi in range(query_th.size(2)):
+                #    qz[:,:,qi,:]= torch.matmul(query_th[:,:,qi,:].unsqueeze(2),self.key_z[:,:,:,qi].unsqueeze(3)).squeeze(3) #bn1d*bnd1=bn11
+
+                self.key_z = torch.cumsum(key_exp, dim=3) 
+                qz = torch.diagonal(torch.matmul(query_exp,self.key_z), dim1=2, dim2=3) #diag(bnqd*bndk)=bnq1
+                qz = qz.unsqueeze(3)
+                attn_output = torch.div(attn_output, qz)  # bnqd/bnq1
+                '''
+            else: #inference
+                
+                self.kv_state += torch.matmul(
+                    key_states_th, value_states #bnd1,bn1d->bndd
+                ) 
+                #COMPUTE similarity for attention
+                attn_output = torch.matmul(query_th, self.kv_state)#bnkd
+                #TODO: add spiking
+                #attn_output = self.act_func(attn_output/self.threshold - 1.0)
+                self.key_z += key_states_th
+                qz= torch.matmul(query_th,self.key_z) 
+                
+                attn_output = torch.div(attn_output, qz) 
+            '''
+            #Parallelize
+            self.key_mem = torch.cumsum(key_states_th, dim=-1)
+            
+            #compute K*V in parallel
+            #S = sum_j=1^i (Kj*Vj)
+            key_states_th = key_states_th.transpose(3, 2).flatten(1,2) #b(nk)d
+            value_states_th = value_states.flatten(1,2) #b(nk)d
+            kv_states= torch.matmul(
+                key_states_th.unsqueeze(3), value_states_th.unsqueeze(2) #b(nk)d1,b(nk)1d->b(nk)dd
+            ) 
+            kv_states= kv_states.unflatten(1, (self.n_heads, key_length)) #bnkdd
+            kv_states = torch.cumsum(kv_states,dim=2)
+            #COMPUTE similarity for attention
+            for qi in range(hidden_states.size(1)): 
+                attn_o = torch.matmul(query_th[:,:,qi,:].unsqueeze(2), kv_states[:,:,qi,:,:]) #bn1d
+                attn_o = attn_o / torch.matmul(query_th[:,:,qi,:].unsqueeze(2), self.key_mem[:,:,:,qi].unsqueeze(3)) #bn1d/bn11
+                attn_output[:,:,qi,:] = attn_o.squeeze(2)
+            '''
+            
         #-----------------------------#
         # Regular computation of attention
         #-----------------------------#
-        # compute scores
-        self.key_length = key_length
-        self.real_key_length = real_key_length
-        if self.sparse==True: #TODO: convert to sparse matrix
-            '''
-            scores = torch.matmul(
-                query_states, key_states.transpose(3, 2)
-            ) 
-            '''
-            
-            #activate based on norm of each seq location
-            #current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
-            #current_key = current_key.transpose(3,2)
-            #TODO:compare with threshold
-            key_states_th = key_states # / self.threshold -1.0
-            
-            key_states_th= key_states_th.transpose(3, 2) #bndk
-            key_states_th= key_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)k
-            key_select, select_index = self.act_func(key_states_th) #b(nd)k->b(nd)s
-            #key_select= torch.cat([key_select, hidden_states], dim=2)
-            key_select= key_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim, -1) 
-            #add the current state on the diag
-            #key_states = torch.cat((key_select,current_key), dim=3)
-            key_length = key_select.shape[3] 
+        else: 
+            # compute scores
             self.key_length = key_length
             self.real_key_length = real_key_length
-            scores = torch.matmul(
-                query_states, key_select #bnqd,bnsd->bnqs
-            ) 
-        
-        else:
-            scores = torch.matmul(
-                query_states, key_states.transpose(3, 2)
-            )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
-
-        if position_bias is None:
-            if not self.has_relative_attention_bias:
-                position_bias = torch.zeros(
-                    (1, self.n_heads, real_seq_length, real_key_length), device=scores.device, dtype=scores.dtype
-                )
-                if self.training and self.gradient_checkpointing:
-                    position_bias.requires_grad = True
-            else:
-                position_bias = self.compute_bias(real_seq_length, real_key_length)
-
-            # if key and values are already calculated
-            # we want only the last query position bias
-            if past_key_value is not None:
-                position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
-
-            if mask is not None:
-                position_bias = position_bias + mask.to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
+            if self.sparse==True: #TODO: convert to sparse matrix
+                '''
+                scores = torch.matmul(
+                    query_states, key_states.transpose(3, 2)
+                ) 
+                '''
                 
-                #position_bias = position_bias[:,:,:,:key_length] + mask[:,:,:,:key_length].to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
-                #print('Check Mask', mask.shape,mask)
-        
+                #activate based on norm of each seq location
+                #current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
+                #current_key = current_key.transpose(3,2)
+                #TODO:compare with threshold
+                key_states_th = key_states # / self.threshold -1.0
+                
+                key_states_th= key_states_th.transpose(3, 2) #bndk
+                key_states_th= key_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)k
+                key_select, select_index = self.act_func(key_states_th) #b(nd)k->b(nd)s
+                #key_select= torch.cat([key_select, hidden_states], dim=2)
+                key_select= key_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim, -1) 
+                #add the current state on the diag
+                #key_states = torch.cat((key_select,current_key), dim=3)
+                key_length = key_select.shape[3] 
+                self.key_length = key_length
+                self.real_key_length = real_key_length
+                scores = torch.matmul(
+                    query_states, key_select #bnqd,bnsd->bnqs
+                ) 
+                
+                '''
+                #use maxpooling
+                current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
+                current_key = current_key.transpose(3,2)
+                key_select= key_states.transpose(3, 2) #bndk
+                key_select= key_select.reshape(batch_size,self.inner_dim, -1) #key_length)
+                key_select = F.max_pool1d(key_select, kernel_size=self.window_size, padding=2) #bndk->bnds
+                key_select= key_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
+                #add the current state on the diag
+                key_select = torch.cat((key_select,current_key), dim=3)
+                key_length = key_select.shape[3] #reduced key length
 
-        if self.sparse==True: 
-            '''
-            scores += position_bias
-            '''
-            position_bias=  position_bias.reshape(batch_size, self.n_heads*hidden_states.size(1), real_key_length)
-            select_bias = torch.zeros((batch_size, self.n_heads*hidden_states.size(1), key_length), device=scores.device, dtype=scores.dtype)
-            for i in range(batch_size):
-                select_bias[i,:,:] = torch.index_select(position_bias[i,:,:], dim=1, index=select_index[i,:]) 
-            select_bias= select_bias.reshape(batch_size,self.n_heads, hidden_states.size(1), key_length)
-            scores += select_bias
-        else:
-            scores += position_bias
-
-        attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
-            scores
-        )  # (batch_size, n_heads, seq_length, key_length)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.dropout, training=self.training
-        )  # (batch_size, n_heads, seq_length, key_length)
-
-        # Mask heads if we want to
-        if layer_head_mask is not None:
-            attn_weights = attn_weights * layer_head_mask
-
-        if self.sparse==True: #TODO: convert to sparse matrix
-            #TODO: reduce length of attention weights from bnqk to bnqs
-            '''
-            attn_weights_th = attn_weights.reshape(batch_size,self.n_heads*hidden_states.size(1), key_length)
-            attn_weights_th = attn_weights_th / self.threshold
-            attn_select, select_index = self.act_func(attn_weights_th)
-            attn_select = attn_select.reshape(batch_size,self.n_heads,hidden_states.size(1), -1)
-            #print(attn_select.shape, attn_weights.shape)
-            self.key_length = attn_select.size(3)
-            self.real_key_length = real_key_length
-            '''
-
-            #activate based on key states
-            #current_value = value_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
-            #current_value = current_value.transpose(3,2)
+                scores = torch.matmul(
+                    query_states, key_select #bnqd,bnsd->bnqs
+                ) 
+                '''
             
-            value_states_th = value_states #/ self.v_threshold
-            value_states_th= value_states_th.transpose(3, 2) #bnvd->bndv
-            value_states_th= value_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)v
-            #print(value_states_th.shape)
-            #TODO: set length
-            #value_select=torch.zeros((batch_size,self.inner_dim, attn_select.size(3))).to(value_states.device)
-            value_select=torch.zeros((batch_size,self.inner_dim, key_length)).to(value_states.device)
+            else:
+                scores = torch.matmul(
+                    query_states, key_states.transpose(3, 2)
+                )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
 
-            #print(value_select.shape)
-            for i in range(batch_size):
-                #for j in range(self.n_heads):
-                value_select[i,:,:] = torch.index_select(value_states_th[i,:,:], dim=1, index=select_index[i,:])  
-            value_select= value_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
-            #add the current state on the diag
-            #value_states = torch.cat((value_select,current_value), dim=3)
+            if position_bias is None:
+                if not self.has_relative_attention_bias:
+                    position_bias = torch.zeros(
+                        (1, self.n_heads, real_seq_length, real_key_length), device=scores.device, dtype=scores.dtype
+                    )
+                    if self.training and self.gradient_checkpointing:
+                        position_bias.requires_grad = True
+                else:
+                    position_bias = self.compute_bias(real_seq_length, real_key_length)
 
-            #TODO:multiply with selected attention weights
-            attn_output = torch.matmul(attn_weights, value_select.transpose(3, 2)) 
-            #attn_output = torch.matmul(attn_select, value_select.transpose(3, 2)) 
+                # if key and values are already calculated
+                # we want only the last query position bias
+                if past_key_value is not None:
+                    position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
 
-        else:
-            attn_output = torch.matmul(attn_weights, value_states) #(bnqk,bnvd)->(bnqd)
+                if mask is not None:
+                    position_bias = position_bias + mask.to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
+                    
+                    #position_bias = position_bias[:,:,:,:key_length] + mask[:,:,:,:key_length].to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
+                    #print('Check Mask', mask.shape,mask)
+            
+
+            if self.sparse==True: 
+                '''
+                scores += position_bias
+                '''
+                position_bias=  position_bias.reshape(batch_size, self.n_heads*hidden_states.size(1), real_key_length)
+                select_bias = torch.zeros((batch_size, self.n_heads*hidden_states.size(1), key_length), device=scores.device, dtype=scores.dtype)
+                for i in range(batch_size):
+                    select_bias[i,:,:] = torch.index_select(position_bias[i,:,:], dim=1, index=select_index[i,:]) 
+                select_bias= select_bias.reshape(batch_size,self.n_heads, hidden_states.size(1), key_length)
+                scores += select_bias
+                
+                '''
+                #maxpooling
+                position_pool = torch.range(0,real_key_length-1,4).long()
+                position_bias = position_bias[:,:,:,position_pool]
+                position_bias = position_bias[:,:,:,:key_length]
+                scores += position_bias
+                #scores += position_bias[:,:,:,:key_length]
+                '''
+            else:
+                scores += position_bias
+
+            attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
+                scores
+            )  # (batch_size, n_heads, seq_length, key_length)
+            attn_weights = nn.functional.dropout(
+                attn_weights, p=self.dropout, training=self.training
+            )  # (batch_size, n_heads, seq_length, key_length)
+
+            # Mask heads if we want to
+            if layer_head_mask is not None:
+                attn_weights = attn_weights * layer_head_mask
+
+            if self.sparse==True: #TODO: convert to sparse matrix
+                #TODO: reduce length of attention weights from bnqk to bnqs
+                '''
+                attn_weights_th = attn_weights.reshape(batch_size,self.n_heads*hidden_states.size(1), key_length)
+                attn_weights_th = attn_weights_th / self.threshold
+                attn_select, select_index = self.act_func(attn_weights_th)
+                attn_select = attn_select.reshape(batch_size,self.n_heads,hidden_states.size(1), -1)
+                #print(attn_select.shape, attn_weights.shape)
+                self.key_length = attn_select.size(3)
+                self.real_key_length = real_key_length
+                '''
+
+                #activate based on key states
+                #current_value = value_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
+                #current_value = current_value.transpose(3,2)
+                
+                value_states_th = value_states #/ self.v_threshold
+                value_states_th= value_states_th.transpose(3, 2) #bnvd->bndv
+                value_states_th= value_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)v
+                #print(value_states_th.shape)
+                #TODO: set length
+                #value_select=torch.zeros((batch_size,self.inner_dim, attn_select.size(3))).to(value_states.device)
+                value_select=torch.zeros((batch_size,self.inner_dim, key_length)).to(value_states.device)
+
+                #print(value_select.shape)
+                for i in range(batch_size):
+                    #for j in range(self.n_heads):
+                    value_select[i,:,:] = torch.index_select(value_states_th[i,:,:], dim=1, index=select_index[i,:])  
+                value_select= value_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
+                #add the current state on the diag
+                #value_states = torch.cat((value_select,current_value), dim=3)
+
+                #TODO:multiply with selected attention weights
+                attn_output = torch.matmul(attn_weights, value_select.transpose(3, 2)) 
+                #attn_output = torch.matmul(attn_select, value_select.transpose(3, 2)) 
+
+                '''
+                #use maxpooling
+                current_value = value_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
+                current_value = current_value.transpose(3,2)
+
+                value_select= value_states.transpose(3, 2) #bnvd->bndv
+                value_select= value_select.reshape(batch_size,self.inner_dim, -1)
+                value_select = F.max_pool1d(value_select, kernel_size=self.window_size, padding=2) #bndv->bnds
+                value_select= value_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
+                #add the current state on the diag
+                value_select = torch.cat((value_select,current_value), dim=3)
+                value_select= value_select.transpose(3, 2) #bnds->bnsd
+                attn_output = torch.matmul(attn_weights, value_select) #(bnqs,bnsd)->(bnqd)
+                '''
+            else:
+                attn_output = torch.matmul(attn_weights, value_states) #(bnqk,bnvd)->(bnqd)
 
 
 
