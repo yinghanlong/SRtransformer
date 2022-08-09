@@ -362,6 +362,7 @@ def main():
     else:
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
+   
 
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
@@ -559,16 +560,20 @@ def main():
     log_step= 200
     eval_log_step= 100
     use_mem = True #TODO: set to true for spiking networks
+    ffn_spike= True
+    attn_spike= not ffn_spike
     
     for epoch in range(args.num_train_epochs):
         if use_mem:
-            logger.info(f"Use positive spikes and thresholds with size=inner_dim. Training shift mem_out by 1 each step. Apply spiking equation 3 with init thre=0.1. q is not changed, Using a mem network with ONLY ONE linear layers and tanh  before proj layers for k/v")
+            #logger.info(f"Use 4 steps for each attn input(init thre=0.1). global SNN with a linear layer outside of loop Before proj on hidden states with leak and reset")
+            logger.info(f"SNN in FFN with leak and reset. With sparse attention (size=32,select value by key)")
+            #logger.info(f"Using a mem network with ONE linear layers and tanh  before proj layers for k/v. thresholds with size=inner_dim. Training shift mem_out by 1 each step. Apply spiking equation 3 with init thre=1. q is not changed")
             #logger.info(f"Using separate mem gates after proj layers for keys/values")
             #logger.info(f"Using maxpooling to make attention sparse! Keep current key/values")
             #logger.info(f"New:  scores= q_exp*k_exp, k_exp=exp(k-mean), q_exp=exp(q-mean),  compute (q_exp+position)*k_exp)*v/sum(k_exp)*(q_exp+position)")
             #logger.info(f"Implemented backward gradients Using linear transformer, phi(attnout)=ELU, grad K=SV, grad V=S*K from N-1 to 0, position bias(q,1), torch.div(attn,qz)")#position bias size(1,k)
             #logger.info(f"Using linear transformer, phi(k)=linearspike(x/thre-1.0)")#position bias size(1,k)
-            #logger.info(f"Using seq-based sparse activation on keys! set size>=K/2.  Keep current key/values. Turned off topk sorting")
+            #logger.info(f"Put mem_func ahead of spiking. Attn_out=(Q*Ks)*Vs+ rnn(Q).Timestep=1. Using seq-based sparse activation on keys/values! set size=32. Use an act_sparse_func")
             logger.info(f"Connect type={model.module.decoder.block[0].layer[0].SelfAttention.connect_type}")
             logger.info(f"Using {model.module.decoder.block[0].layer[0].SelfAttention.window_size} recurrent spiking mem gate!")
         avg_spiking_rate= torch.zeros(config.num_layers)
@@ -603,9 +608,16 @@ def main():
                 if step%log_step==1:
                     for i in range(config.num_layers):
                         print('loss ', loss)
-                        if use_mem==True:
+                        if ffn_spike==True:
+                                
+                            print('spiking rate of ffn layer ',i,model.module.decoder.block[i].layer[2].DenseReluDense.spiking_rate.cpu())
+                            print('ffn threshold=',torch.mean(model.module.decoder.block[i].layer[2].DenseReluDense.threshold))
+                            print('ffn leak=',torch.mean(model.module.decoder.block[i].layer[2].DenseReluDense.leak)) 
+                            avg_spiking_rate[i]+=model.module.decoder.block[i].layer[2].DenseReluDense.spiking_rate.cpu()
+                        if attn_spike==True:
                             print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
-                            print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
+                            print('threshold=',torch.mean(model.module.decoder.block[i].layer[0].SelfAttention.threshold))
+                            print('attention leak=',torch.mean(model.module.decoder.block[i].layer[0].SelfAttention.leak))
                             #print("reduce length to=",model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length)
                             avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
                 total_steps= step
@@ -630,7 +642,12 @@ def main():
         total_steps=0
 
         for i in range(config.num_layers):
-            logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
+            if ffn_spike:
+                logger.info(f"threshold={model.module.decoder.block[i].layer[2].DenseReluDense.threshold}")
+                logger.info(f"leak={model.module.decoder.block[i].layer[2].DenseReluDense.leak}")
+            if attn_spike:
+                logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
+                logger.info(f"leak={model.module.decoder.block[i].layer[0].SelfAttention.leak}")
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 generated_tokens = model.module.generate(#accelerator.unwrap_model(model).generate(
@@ -645,11 +662,16 @@ def main():
                     for i in range(config.num_layers):
                         #if use_mem==True:
                             #logger.info(f"reduce length to={model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length}")
-                         
-                        print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
-                            #print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
-                    #if use_mem==True:
-                        avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
+                        
+                        if ffn_spike:
+                            print('spiking rate of ffn layer ',i,model.module.decoder.block[i].layer[2].DenseReluDense.spiking_rate.cpu())
+                            print('ffn threshold=',torch.mean(model.module.decoder.block[i].layer[2].DenseReluDense.threshold))
+                            avg_spiking_rate[i]+=model.module.decoder.block[i].layer[2].DenseReluDense.spiking_rate.cpu()
+                        if attn_spike:
+                            print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
+                            print('threshold=',model.module.decoder.block[i].layer[0].SelfAttention.threshold)
+                            avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
+                    
 
                 generated_tokens = accelerator.pad_across_processes(
                     generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
