@@ -176,11 +176,11 @@ class GPT2Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        print("q,k,v shape", query.shape, key.shape, value.shape)
+        #print("q,k,v shape", query.shape, key.shape, value.shape)
         #TODO: Add recurrency to the attention block
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
-        print("attn weights shape",attn_weights.shape)
+        #print("attn weights shape",attn_weights.shape)
         if self.scale_attn_weights:
             attn_weights = attn_weights / (float(value.size(-1)) ** 0.5)
 
@@ -202,7 +202,7 @@ class GPT2Attention(nn.Module):
             attn_weights = attn_weights * head_mask
 
         attn_output = torch.matmul(attn_weights, value)
-        print("output shape",attn_output.shape)
+        #print("output shape",attn_output.shape) 1024
 
 
         return attn_output, attn_weights
@@ -954,7 +954,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         if use_cache:
             print("use cache is true")
         else:
-            print("use cache is false")
+            #print("use cache is false")
             
         transformer_outputs = self.transformer(
             input_ids,

@@ -211,6 +211,7 @@ def main():
     accelerator = Accelerator()
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
+        filename=args.output_dir+'results.log',
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
@@ -477,9 +478,13 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
 
+    '''
     use_cache = True
     gen_kwargs = {
         "use_cache": use_cache,
+    }
+    '''
+    gen_kwargs = {
     }
     if args.evaluation_only:
         args.num_train_epochs=1
@@ -489,7 +494,10 @@ def main():
             model.train()
             for step, batch in enumerate(train_dataloader):
                 outputs = model(**batch)
-                loss = outputs.loss
+                if 'transfo-xl' in args.model_name_or_path:
+                    loss = outputs.losses.mean()
+                else:
+                    loss = outputs.loss
                 loss = loss / args.gradient_accumulation_steps
                 accelerator.backward(loss)
                 if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
@@ -509,7 +517,11 @@ def main():
                 #Set use_cache=True to use previous values
                 outputs = model(**batch, **gen_kwargs)
 
-            loss = outputs.loss
+            
+            if 'transfo-xl' in args.model_name_or_path:
+                loss = outputs.losses.mean()
+            else:
+                loss = outputs.loss
             losses.append(accelerator.gather(loss.repeat(args.per_device_eval_batch_size)))
 
         losses = torch.cat(losses)

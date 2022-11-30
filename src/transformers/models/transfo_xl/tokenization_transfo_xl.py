@@ -512,6 +512,8 @@ class LMOrderedIterator(object):
         # Number of mini-batches
         self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
 
+    def get_n_batch(self):
+        return self.n_batch
     def get_batch(self, i, bptt=None):
         if bptt is None:
             bptt = self.bptt

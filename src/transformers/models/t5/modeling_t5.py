@@ -314,13 +314,15 @@ class T5DenseSpike(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.wi = nn.Linear(config.d_model, config.d_ff, bias=False)
-        #self.hidden = nn.Linear(config.d_ff, config.d_ff, bias=False)
+        self.hidden = nn.Linear(config.d_ff, config.d_ff, bias=False)
         self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
-        #self.dropout = nn.Dropout(config.dropout_rate)
+        self.dropout = nn.Dropout(config.dropout_rate)
         self.act = LinearSpike.apply
         self.is_decoder = config.is_decoder 
-        self.leak = nn.Parameter(torch.ones(1))
-        self.threshold = nn.Parameter(torch.ones(1))
+        self.leak = nn.Parameter(0.5*torch.ones(1))
+        self.threshold = nn.Parameter(0.1*torch.ones(1))
+        self.neg_act = LinearNegSpike.apply
+        self.neg_threshold = nn.Parameter(-0.1*torch.ones(1))
         self.spiking_rate= 0.0
         self.local_recur = False
         self.local_window= 16
@@ -335,7 +337,7 @@ class T5DenseSpike(nn.Module):
                 self.mem = torch.zeros_like(hidden_states).to(hidden_states.device)
                 for i in range(self.local_window):
                     #TODO: put NN layer inside loop
-                    hidden_states = self.wi(hidden_states)
+                    #hidden_states = self.wi(hidden_states)
                     self.mem = self.leak * self.mem + hidden_states
                     mem_thr = self.mem / self.threshold - 1.0
                     rst = self.threshold * (mem_thr>0).float()
@@ -344,44 +346,61 @@ class T5DenseSpike(nn.Module):
                     hidden_states = torch.cat((torch.zeros(batch,1,dim).to(hidden_states.device),hidden_states),dim=1)[:,:seq_len,:]
             else:
                 self.mem = torch.zeros(batch,1,dim).to(hidden_states.device)
+                #Note:keep a memory of full size
+                #self.mem = torch.zeros_like(hidden_states).to(hidden_states.device)
                 for i in range(seq_len):
-                    for j in range(self.spike_steps):
-                        #TODO: put NN layer inside loop? no difference between this and putting outside
-                        #hidden_states = self.wi(hidden_states[:,i,:].unsqueeze(1))
-                        #Use a hidden gate for Vmem
-                        self.mem = self.leak * self.mem + hidden_states[:,i,:].unsqueeze(1)
-                        new_spike  = self.mem / self.threshold - 1.0
-                        rst = self.threshold * (new_spike>0).float()
-                        self.mem = self.mem - rst
+                    self.mem = self.leak * self.mem + hidden_states[:,i,:].unsqueeze(1)
+                    #input_til_now = torch.cat((hidden_states[:,:i+1,:],torch.zeros(batch,seq_len-1-i,dim).to(hidden_states.device)),dim=1)
+                    
+                    new_spike  = self.mem/ self.threshold - 1.0
+                    rst = self.threshold * (new_spike>0).float()
+                    self.mem = self.mem - rst
+                    #negative spike
+                    
+                    neg_spike  = self.mem/ self.neg_threshold - 1.0
+                    negrst = self.neg_threshold * (neg_spike<0).float()
+                    self.mem = self.mem - negrst
+                    
                     #only take the output of last timestep
                     if i==0:
                         mem_thr = new_spike
+                        neg_mem = neg_spike
                     else: #last one
-                        mem_thr = torch.cat((mem_thr, new_spike),dim=1)
+                        mem_thr = torch.cat((mem_thr, new_spike),dim=1)    
+                        neg_mem = torch.cat((neg_mem, neg_spike),dim=1)      
+                    
+                    #Use a hidden gate for Vmem
+                    #self.mem = self.hidden(self.mem)
+                    
         else:
             if t==0:
                 self.mem = torch.zeros_like(hidden_states).to(hidden_states.device)
-            #TODO: use multi steps for each input
-            for j in range(self.spike_steps):
-                self.mem = self.leak * self.mem + hidden_states
-                mem_thr = self.mem / self.threshold - 1.0
-                rst = self.threshold * (mem_thr>0).float()
-                self.mem = self.mem - rst
-
+        
+            self.mem = self.leak * self.mem + hidden_states
+            mem_thr = self.mem / self.threshold - 1.0
+            rst = self.threshold * (mem_thr>0).float()
+            self.mem = self.mem - rst
+            #negative spike
+            
+            neg_mem  = self.mem/ self.neg_threshold - 1.0
+            negrst = self.neg_threshold * (neg_mem<0).float()
+            self.mem = self.mem - negrst
+            
+            #self.mem = self.hidden(self.mem)
+            
         out = self.act(mem_thr)
+        out = out + self.neg_act(neg_mem)
+        #out = nn.functional.relu(mem_thr)
+        #out = self.dropout(out)
         self.spiking_rate= torch.count_nonzero(out)/(out.shape[0]*out.shape[1]*out.shape[2])
 
-        #out = self.dropout(out)
         out = self.wo(out)
         return out
 
-class T5LayerFF(nn.Module):
+class T5LayerSpikingFF(nn.Module):
     def __init__(self, config):
         super().__init__()
-        if config.feed_forward_proj == "relu" and not config.is_decoder:
-            self.DenseReluDense = T5DenseReluDense(config)
-        #TODO: SNN spiking Activation
-        elif config.is_decoder and config.feed_forward_proj == "relu":
+        if config.feed_forward_proj == "relu":
             self.DenseReluDense = T5DenseSpike(config)
             logger.info("***** Using spike activation in FFN *****")
         elif  config.feed_forward_proj == "gated-gelu":
@@ -398,7 +417,28 @@ class T5LayerFF(nn.Module):
     def forward(self, hidden_states,t=0):
         forwarded_states = self.layer_norm(hidden_states)
         forwarded_states = self.DenseReluDense(forwarded_states,t)
-        #TODO: add spiking integrate-and-fire mem
+        hidden_states = hidden_states + self.dropout(forwarded_states)
+        return hidden_states
+
+class T5LayerFF(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        if config.feed_forward_proj == "relu":
+            self.DenseReluDense = T5DenseReluDense(config)
+        elif  config.feed_forward_proj == "gated-gelu":
+            self.DenseReluDense = T5DenseGatedGeluDense(config)
+
+        else:
+            raise ValueError(
+                f"{self.config.feed_forward_proj} is not supported. Choose between `relu` and `gated-gelu`"
+            )
+        self.is_decoder = config.is_decoder 
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(self, hidden_states,t=0):
+        forwarded_states = self.layer_norm(hidden_states)
+        forwarded_states = self.DenseReluDense(forwarded_states,t)
         hidden_states = hidden_states + self.dropout(forwarded_states)
         return hidden_states
 
@@ -487,6 +527,7 @@ class SequenceSpike(torch.autograd.Function):
         i_norm = torch.mean(input, dim=1)
         #i_norm = torch.norm(input, dim=1) #size= b1k or bk
         #***note: set a size
+        '''
         select_size= min(k_size, max(8,int(k_size/2))) #if k<8, s=k; if k>16, s=k/2. if 8<k<16, k=8
         #i_norm = F.threshold(i_norm, threshold, 0)
         #TODO: select by threshold
@@ -496,9 +537,10 @@ class SequenceSpike(torch.autograd.Function):
         bool_select = i_norm > 0.0 #15.0 #mean of norm=11
         count_select =  torch.sum(bool_select,dim=1)
         max_size = torch.max(count_select)
+        '''
+        #select_size =  max(select_size, max_size)
         #TODO: set a constant for size
         select_size= min(k_size, 32)
-        #select_size =  max(select_size, max_size)
         #select_size = min( max(max_size, int(k_size/4) ), select_size)
         #TODO: test full length
         #select_size = k_size
@@ -510,9 +552,8 @@ class SequenceSpike(torch.autograd.Function):
         current_index = torch.full((batch_size,1), k_size-1)
         current_index.to(select_idx.device)
         select_idx = torch.cat((select_idx,current_index.to(select_idx.device)), dim=1)
+        select_size= select_idx.size(1)
         '''
-
-        #select_size= select_idx.size(1)
         #select_idx = i_norm>0 #torch.nonzero(i_norm)  #size= (s,3), s=number of nonzeros, 3=number of dim in index
         #print(i_norm.shape, select_idx.shape)
         ctx.save_for_backward(input,select_idx)
@@ -578,6 +619,32 @@ class LinearSpike(torch.autograd.Function):
         #grad       = LinearSpike.gamma*F.threshold(input, 0, 0)
 
         #equation 1: if out[input>0]=1
+        grad       = LinearSpike.gamma*F.threshold(1.0-torch.abs(input), 0, 0)
+        return grad*grad_input, None
+
+class LinearNegSpike(torch.autograd.Function):
+    """
+    Here we use the piecewise-linear surrogate gradient as was done
+    in Bellec et al. (2018).
+    """
+    gamma = 0.3 # Controls the dampening of the piecewise-linear surrogate gradient
+
+    @staticmethod
+    def forward(ctx, input):
+        
+        ctx.save_for_backward(input)
+        out = torch.zeros_like(input).cuda()
+        out[input < 0] = -1.0 #input[input > 0] #1.0 #TODO: binary spike or full-precision?
+        #out[input> 1.0] = 1.0
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        
+        input,     = ctx.saved_tensors
+        grad_input = grad_output.clone()
+
+        #equation 1: if out[input<0]=1
         grad       = LinearSpike.gamma*F.threshold(1.0-torch.abs(input), 0, 0)
         return grad*grad_input, None
 
@@ -696,7 +763,7 @@ class MemNetwork(nn.Module):
 
 
 class T5Attention(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias=False, use_mem=False):
+    def __init__(self, config: T5Config, has_relative_attention_bias=False, use_mem=False, split_crossattn=False):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.has_relative_attention_bias = has_relative_attention_bias
@@ -709,7 +776,7 @@ class T5Attention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         self.use_mem = use_mem
-        activate_sparse = True
+        activate_sparse = False
         self.key_length = 32 #will set when running forward()
         self.real_key_length= 32
         self.sparse = use_mem and activate_sparse
@@ -721,7 +788,7 @@ class T5Attention(nn.Module):
             #self.threshold  = torch.nn.Parameter( 0.1*torch.ones(self.inner_dim),requires_grad=True)
             self.threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
             self.leak  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
-            self.v_threshold  = torch.nn.Parameter( torch.ones(1),requires_grad=True) #different thresholds for key and value
+            self.v_threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True) #different thresholds for key and value
             self.local_connect  =torch.nn.Parameter(torch.randn(4),requires_grad=True)
             
             
@@ -745,13 +812,34 @@ class T5Attention(nn.Module):
                 #nn.ReLU())#b(nd)k->b(nd)s
             if self.enable_reset==True:
                 logger.info(f"Resetting spiking mem= {self.threshold}")
-        # Mesh TensorFlow initialization to avoid scaling before softmax
-        self.spike_linear = nn.Linear(self.d_model, self.d_model, bias=False)
+            # Mesh TensorFlow initialization to avoid scaling before softmax
+            #self.spike_linear = nn.Linear(self.d_model, self.d_model, bias=False)
+            self.k_linear = nn.Linear(self.d_model, self.d_model, bias=False)
+            self.v_linear = nn.Linear(self.d_model, self.d_model, bias=False)
         #self.spike_forget = nn.Linear(self.d_model, self.d_model, bias=False)
         self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+
+
+        #TODO:Set to true to split encoded features into segments for cross-attention
+        self.split_crossattn = split_crossattn 
+        if self.split_crossattn==True:
+            self.act_func 	= LinearSpike.apply 
+            self.split_size= 8 #For cnn-dailymail, use 8 because encode_size=1024, decode_size=128. If split_size=1024, it's not split
+            self.RNN_key = nn.RNN(self.inner_dim, self.inner_dim, batch_first=True)
+            self.SNN_key = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+            self.RNN_value = nn.RNN(self.inner_dim, self.inner_dim, batch_first=True)
+            self.SNN_value = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+            self.recur_select= 1 #set to 0 for SNN, 1 for RNN, 2 for none      
+            self.concat_mem = True   
+            self.threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
+            self.leak  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
+            self.v_leak  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
+            self.v_threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
+            logger.info(f"Splitting encoded features in cross attention, size= {self.split_size}, recur_select={self.recur_select}")
+
 
         if self.has_relative_attention_bias:
             self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
@@ -864,33 +952,39 @@ class T5Attention(nn.Module):
 
         real_seq_length = seq_length
         if t==0: #initialize spiking neurons
-            self.recur_mem =torch.zeros_like(hidden_states).to(hidden_states.device)
-            if self.training:
-                mem_length = seq_length
-                self.hidden_mem = None
-                self.key_mem = None 
-                self.key_z = torch.zeros(batch_size, self.n_heads,  self.key_value_proj_dim, 1).to(hidden_states.device)
-                self.value_mem = None
-            else:
-                mem_length = 1
-                self.hidden_mem = torch.zeros(batch_size, 1,self.inner_dim).to(hidden_states.device)
-                self.value_mem = torch.zeros(batch_size, self.n_heads, 1,self.key_value_proj_dim).to(hidden_states.device)
-                self.key_mem = torch.zeros(batch_size, self.n_heads, 1, self.key_value_proj_dim).to(hidden_states.device)
-                self.key_z = torch.zeros(batch_size, self.n_heads, self.key_value_proj_dim, 1).to(hidden_states.device)
+            if self.split_crossattn==True:
+                if self.recur_select==0: #SNN
+                    self.key_mem = torch.zeros(batch_size, self.split_size, self.inner_dim).to(hidden_states.device)
+                    self.value_mem = torch.zeros(batch_size, self.split_size ,self.inner_dim).to(hidden_states.device)
+                elif self.recur_select==1: #RNN
+                    self.key_mem = torch.zeros(1, batch_size, self.inner_dim).to(hidden_states.device)
+                    self.value_mem = torch.zeros(1, batch_size, self.inner_dim).to(hidden_states.device)
+            if self.use_mem==True:
+                self.recur_mem =torch.zeros_like(hidden_states).to(hidden_states.device)
+                if self.training:
+                    mem_length = seq_length
+                    self.hidden_mem = None
+                    self.key_mem = None 
+                    self.key_z = torch.zeros(batch_size, self.n_heads,  self.key_value_proj_dim, 1).to(hidden_states.device)
+                    self.value_mem = None
+                else:
+                    mem_length = 1
+                    self.hidden_mem = torch.zeros(batch_size, 1,self.inner_dim).to(hidden_states.device)
+                    self.value_mem = torch.zeros(batch_size, self.n_heads, 1,self.key_value_proj_dim).to(hidden_states.device)
+                    self.key_mem = torch.zeros(batch_size, self.n_heads, 1, self.key_value_proj_dim).to(hidden_states.device)
+                    self.key_z = torch.zeros(batch_size, self.n_heads, self.key_value_proj_dim, 1).to(hidden_states.device)
 
-            # (batch_size, n_heads, key_length, dim_per_head)
-            #TODO: enable spiking mem
-            self.k_max = None
-            self.q_max = None
-            self.mem_h=None
-            
-            self.hidden_states_mem = torch.zeros(batch_size, mem_length,self.inner_dim).to(hidden_states.device)
-            
-            self.key_states_mem = torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
-            self.value_states_mem = torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
-            #***set recurrent states S=KV*****#
-            #self.kv_state = torch.zeros(batch_size, self.n_heads,self.key_value_proj_dim,self.key_value_proj_dim).to(hidden_states.device)
-            self.qh = torch.zeros(1, batch_size, self.inner_dim).to(hidden_states.device)
+                # (batch_size, n_heads, key_length, dim_per_head)
+                #TODO: enable spiking mem
+                self.mem_h=None
+                
+                self.hidden_states_mem = torch.zeros(batch_size, mem_length,self.inner_dim).to(hidden_states.device)
+                
+                self.key_states_mem = torch.zeros(batch_size, mem_length,self.inner_dim).to(hidden_states.device)#torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
+                self.value_states_mem = torch.zeros(batch_size, mem_length,self.inner_dim).to(hidden_states.device)#torch.zeros(batch_size, self.n_heads, mem_length,self.key_value_proj_dim).to(hidden_states.device)
+                #***set recurrent states S=KV*****#
+                #self.kv_state = torch.zeros(batch_size, self.n_heads,self.key_value_proj_dim,self.key_value_proj_dim).to(hidden_states.device)
+                #self.qh = torch.zeros(1, batch_size, self.inner_dim).to(hidden_states.device)
             
 
         if past_key_value is not None:
@@ -926,7 +1020,7 @@ class T5Attention(nn.Module):
                 if key_value_states is None:
                     # self-attn
                     # (batch_size, n_heads, key_length, dim_per_head)
-                    if True:#self.use_mem== False: #do not use this if spiking neurons are used
+                    if self.use_mem== False: #do not use this if spiking neurons are used
                         hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
                     else:
                         hidden_states = hidden_states
@@ -1176,12 +1270,11 @@ class T5Attention(nn.Module):
                 else:
                     Vmem = torch.zeros(batch,1,dim).to(hidden_states.device)
                     for i in range(seq_len):
-                        for j in range(self.spike_steps):
-                            Vmem = self.leak * Vmem + hidden_states[:,i,:].unsqueeze(1)
-
-                            new_spike = Vmem / threshold - 1.0
-                            rst = threshold * (new_spike>0).float()
-                            Vmem = Vmem - rst
+                        #for j in range(self.spike_steps):
+                        Vmem = self.leak * Vmem + hidden_states[:,i,:].unsqueeze(1)
+                        new_spike = Vmem / threshold - 1.0
+                        rst = threshold * (new_spike>0).float()
+                        Vmem = Vmem - rst
                         if i==0:
                             mem_thr = new_spike
                         else:
@@ -1196,33 +1289,57 @@ class T5Attention(nn.Module):
 
             #out = mem_thr #self.act_func(mem_thr)
             out = self.act_func(mem_thr)
-            self.spiking_rate= torch.count_nonzero(out)/(out.shape[0]*out.shape[1]*out.shape[2])
+            self.spiking_rate= torch.count_nonzero(out)/(out.shape[0]*out.shape[1]*out.shape[2]*out.shape[3])
 
             return out, Vmem
 
-        #TODO: add recurrent gate before proj layers
+        def SNN_apply(input_states, Vmem, layer, threshold, leak):
+            Vmem = leak * Vmem + layer(input_states)
+            mem_thr = Vmem / threshold - 1.0
+            rst = threshold * (mem_thr>0).float()
+            Vmem = Vmem - rst
+            out = self.act_func(mem_thr)
+            self.spiking_rate= torch.count_nonzero(out)/(out.shape[0]*out.shape[1]*out.shape[2])
+
+            return out, Vmem
+            
+        #add recurrent gate before proj layers
         
         #q_hidden_states = torch.clone(hidden_states)
-        #if self.use_mem==True:
+        if self.use_mem and False ==True: #disabled
             #batch, seq, dim
+            #TODO: use SNN
+            key_states, self.key_states_mem= spike_apply(hidden_states, self.key_states_mem, self.threshold, self.k_linear)
+            value_states, self.value_states_mem= spike_apply(hidden_states, self.value_states_mem, self.v_threshold, self.v_linear)
+            
+            self.spiking_rate= torch.count_nonzero(key_states)/(key_states.shape[0]*key_states.shape[1]*key_states.shape[2])
+            self.v_spiking_rate= torch.count_nonzero(value_states)/(key_states.shape[0]*key_states.shape[1]*key_states.shape[2])
             #hidden_states, self.hidden_states_mem= spike_apply(hidden_states, self.hidden_states_mem, self.threshold, self.spike_linear)
             
             #hidden_states, self.hidden_states_mem = spike_apply(hidden_states,self.hidden_states_mem, self.threshold)
             #hidden_states, self.hidden_states_mem, self.hidden_mem, self.mem_h = recurrent_apply(hidden_states, self.hidden_states_mem,t, self.hidden_mem, self.mem_h)
             #hidden_states, self.recur_mem = self.recurrent(hidden_states, self.recur_mem)
-        
+                # get key/value states
+            key_states = project(
+                key_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
+            )
+            value_states = project(
+                value_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
+            )
+        else:
+            # get key/value states
+            key_states = project(
+                hidden_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
+            )
+            value_states = project(
+                hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
+            )
         
 
         # get query states
         query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
 
-        # get key/value states
-        key_states = project(
-            hidden_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
-        )
-        value_states = project(
-            hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
-        )
+        
 
         #print qkv shape
         #if key_value_states is None:
@@ -1239,18 +1356,87 @@ class T5Attention(nn.Module):
 
             self.threshold.to(key_states.device)
             self.v_threshold.to(key_states.device)
+            
         
         select_index =None 
         key_select = None
-
+        real_key_length =key_length
     
         #-----------------------------#
         # Regular computation of attention
         #-----------------------------#
         # compute scores
         self.key_length = key_length
-        self.real_key_length = key_length
-        if self.sparse==True: #TODO: convert to sparse matrix
+        self.real_key_length = real_key_length
+        
+
+        #TODO: split encoder features into segments
+        if self.split_crossattn==True:
+            #pad with zero
+            if key_states.shape[2] % self.split_size != 0:
+                #print("****padding encoded keys****", key_states.shape)
+                pad_size = self.split_size* math.ceil(key_states.shape[2]/self.split_size) - key_states.shape[2]
+                key_states = nn.functional.pad(key_states, (0,0,0, pad_size), "constant",0)
+                #print("****padded encoded keys****",pad_size, key_states.shape)
+        
+            #split into chunks and store in a list, bnkd-> q(bnmd), m=split_size
+            key_states_split = torch.split(key_states, self.split_size, dim=2)
+            key_states_split = list(key_states_split)
+            key_states_ori = key_states_split.copy()
+            #multiply Q*K. ***Note: some keys are ignored if the length does not match
+            if self.training==True:
+                query_states_split = torch.split(query_states, 1, dim=2) #check size match
+                #split_len= min(len(key_states_split), len(query_states_split))
+                #print(len(key_states_split),type(key_states_split),type(key_states_split[0]))
+
+                #TODO:SNN integrate and fire or RNN
+                for i in range(len(key_states_split)):
+                    #bn1d
+                    if self.recur_select==0: #SNN, unshape to bk(n*d)
+                        key_states_split[i], self.key_mem = SNN_apply(unshape(key_states_split[i]), self.key_mem, self.SNN_key, self.threshold, self.leak)
+                    elif self.recur_select==1:#RNN
+                        key_states_split[i], self.key_mem = self.RNN_key(unshape(key_states_split[i]), self.key_mem)
+                #reshape and concat
+                if self.recur_select==0 or self.recur_select==1:
+                    if self.concat_mem==True:
+                        key_states_split = [ torch.cat((shape(key_states_split[i]), key_states_ori[i]),dim=2) for i in range(len(key_states_split))]
+                    else:
+                        key_states_split = [shape(key_states_split[i])+key_states_ori[i] for i in range(len(key_states_split))]
+                else:
+                    if self.concat_mem==True:
+                        key_states_split = [ torch.cat((key_states_split[max(0,i-1)], key_states_ori[i]),dim=2) for i in range(len(key_states_split))]
+                    
+                scores = [ torch.matmul(
+                    query_states_split[i], key_states_split[min(len(key_states_split)-1, i)].transpose(3, 2)
+                ) for i in range(len(query_states_split))]
+                scores = torch.stack(scores,dim=2)
+                scores= torch.squeeze(scores, dim=-2)
+            else:
+                split_idx= min(t, len(key_states_split)-1)
+                
+                #TODO:SNN integrate and fire or RNN
+                #bn1d
+                if self.recur_select==0: #SNN
+                    key_states_split[split_idx], self.key_mem = SNN_apply(unshape(key_states_split[split_idx]), self.key_mem, self.SNN_key,self.threshold, self.leak)
+                elif self.recur_select==1:#RNN
+                    key_states_split[split_idx], self.key_mem = self.RNN_key(unshape(key_states_split[split_idx]), self.key_mem)
+                
+                if self.recur_select==0 or self.recur_select==1:
+                    if self.concat_mem==True:
+                        key_states_split[split_idx] = torch.cat( (shape(key_states_split[split_idx]), key_states_ori[split_idx]),dim=2)
+                    else:
+                        key_states_split[split_idx] = shape(key_states_split[split_idx])+ key_states_ori[split_idx]
+                else:
+                    if self.concat_mem==True:
+                        key_states_split[split_idx] = torch.cat( (key_states_split[max(0,split_idx-1)], key_states_ori[split_idx]),dim=2)
+                
+                scores = torch.matmul(
+                    query_states, key_states_split[split_idx].transpose(3, 2) )
+            key_length = self.split_size
+            self.key_length = key_length
+
+
+        elif self.sparse==True: #TODO: convert to sparse matrix
             '''
             scores = torch.matmul(
                 query_states, key_states.transpose(3, 2)
@@ -1261,23 +1447,26 @@ class T5Attention(nn.Module):
             #current_key = key_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
             #current_key = current_key.transpose(3,2)
             #TODO:compare with threshold
-            key_states_th = key_states # / self.threshold -1.0
+            key_states_th = key_states.clone() # / self.threshold -1.0
             
-            key_states_th= key_states_th.transpose(3, 2) #bndk
-            key_states_th= key_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)k
-            
+            key_states_th= unshape(key_states_th) #bndk->bk(nd)
+            #key_states_th= key_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)k
+
+            key_states_th = key_states_th.transpose(1,2)
+
             key_select, select_index = self.act_sparse_func(key_states_th) #b(nd)k->b(nd)s
             key_select= key_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim, -1) 
             #add the current state on the diag
             #key_states = torch.cat((key_select,current_key), dim=3)
             key_length = key_select.shape[3] 
             self.key_length = key_length
-            self.real_key_length = key_length
+            #self.real_key_length = real_key_length
             scores = torch.matmul(
-                query_states, key_select #bnqd,bnsd->bnqs
+                query_states, key_select #bnqd,bnds->bnqs
             ) 
             
             #TODO:recurrent key
+            #TODO: split for cross-attention 
             '''
             self.real_key_length = min(key_length,32)
             scores =torch.zeros((batch_size,self.n_heads, real_seq_length, self.real_key_length)).to(value_states.device)
@@ -1314,12 +1503,11 @@ class T5Attention(nn.Module):
                 position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
 
             if mask is not None:
-                position_bias = position_bias + mask[:,:,:,:self.real_key_length].to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
+                position_bias = position_bias + mask.to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
                 
                 #position_bias = position_bias[:,:,:,:key_length] + mask[:,:,:,:key_length].to(position_bias.device)  # (batch_size, n_heads, seq_length, key_length)
                 #print('Check Mask', mask.shape,mask)
         
-
         if self.sparse==True: 
             '''
             scores += position_bias
@@ -1330,8 +1518,37 @@ class T5Attention(nn.Module):
                 select_bias[i,:,:] = torch.index_select(position_bias[i,:,:], dim=1, index=select_index[i,:]) 
             select_bias= select_bias.reshape(batch_size,self.n_heads, hidden_states.size(1), key_length)
             scores += select_bias
-            
+        #TODO: set special position bias for split encoder features into segments
+        elif self.split_crossattn==True:
+            #print(scores.shape, position_bias.shape)
+
+            if position_bias.shape[-1]<scores.shape[-1]: #padding
+                position_bias =nn.functional.pad(position_bias, (0,scores.shape[-1]-position_bias.shape[-1]), "constant",0)
+            if self.training==True:
+                for i in range(scores.shape[2]):
+                    # im:(i+1)m
+                    pidx = min(i, position_bias.shape[-1]//self.split_size-1)
+                    pid = max(0,pidx-1)
+                    if self.concat_mem==True:
+                        pbias = torch.cat((position_bias[:,:,i, (pid)*self.split_size: (pid+1)*self.split_size], position_bias[:,:,i, (pidx)*self.split_size: (pidx+1)*self.split_size]),dim=-1)
+                    else:
+                        pbias =  position_bias[:,:,i, (pidx)*self.split_size: (pidx+1)*self.split_size]
+                    #print(scores[:,:,i,:].shape,position_bias[:,:,i, pidx*self.split_size: (pidx+1)*self.split_size].shape)
+                    scores[:,:,i,:] += pbias
+            else:
+                split_idx= min(t, len(key_states_split)-1) #int(t/self.split_size)
+                sid= max(0, split_idx-1)
+                if self.concat_mem==True:
+                    pbias= torch.cat((position_bias[:,:,:, sid*self.split_size: (sid+1)*self.split_size],position_bias[:,:,:, (split_idx)*self.split_size: (split_idx+1)*self.split_size]),dim=-1)
+                else:
+                    pbias= position_bias[:,:,:, (split_idx)*self.split_size: (split_idx+1)*self.split_size]
+                
+                #print(scores.shape, position_bias.shape,split_idx)
+                scores += pbias
         else:
+            #key_length = scores.shape[3]
+            #position_bias= position_bias[:,:,:,-key_length:]
+            #print(scores.shape, position_bias.shape)
             scores += position_bias
 
         attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
@@ -1345,7 +1562,70 @@ class T5Attention(nn.Module):
         if layer_head_mask is not None:
             attn_weights = attn_weights * layer_head_mask
 
-        if self.sparse==True: #TODO: convert to sparse matrix
+
+        #TODO: split encoder features into segments
+        if self.split_crossattn==True:
+
+            #pad with zero
+            if value_states.shape[2] % self.split_size != 0:
+                pad_size = self.split_size* math.ceil(value_states.shape[2]/self.split_size) - value_states.shape[2]
+                value_states = nn.functional.pad(value_states, (0,0,0, pad_size), "constant",0)
+            
+            #split into chunks and store in a list
+            value_states_split = torch.split(value_states, self.split_size, dim=2)
+            value_states_split = list(value_states_split)
+            value_states_ori = value_states_split.copy()
+            #check size match
+            assert len(value_states_split)== len(key_states_split)
+
+            if self.training==True:
+                attn_weights_split = torch.split(attn_weights, 1, dim=2)
+                #split_len= min(len(value_states_split), len(attn_weights_split))
+
+                #TODO:SNN integrate and fire or RNN
+                for i in range(len(value_states_split)):
+                    #bn1d
+                    if self.recur_select==0: #SNN
+                        value_states_split[i], self.value_mem = SNN_apply(unshape(value_states_split[i]), self.value_mem, self.SNN_value, self.v_threshold, self.v_leak)
+                    elif self.recur_select==1:#RNN
+                        value_states_split[i], self.value_mem = self.RNN_value(unshape(value_states_split[i]), self.value_mem)
+                
+                #reshape and concat the memory with current input
+                if self.recur_select==0 or self.recur_select==1:
+                    if self.concat_mem==True:
+                        value_states_split = [ torch.cat((shape(value_states_split[i]), value_states_ori[i]),dim=2) for i in range(len(value_states_split))]
+                    else:
+                        value_states_split = [ shape(value_states_split[i])+ value_states_ori[i] for i in range(len(value_states_split))]
+                else:
+                    if self.concat_mem==True:
+                        value_states_split = [ torch.cat((value_states_split[max(0,i-1)], value_states_ori[i]),dim=2) for i in range(len(value_states_split))]
+             
+
+                attn_output = [ torch.matmul(
+                    attn_weights_split[i], value_states_split[min(len(value_states_split)-1,i)]
+                ) for i in range(len(attn_weights_split))]
+                attn_output = torch.stack(attn_output, dim=2)
+                attn_output = torch.squeeze(attn_output, dim=-2)
+            else:
+                split_idx= min(t, len(key_states_split)-1)
+                #TODO:SNN integrate and fire or RNN
+                if self.recur_select==0: #SNN
+                    value_states_split[split_idx], self.value_mem = SNN_apply(unshape(value_states_split[split_idx]), self.value_mem, self.SNN_value, self.v_threshold, self.v_leak)
+                elif self.recur_select==1:#RNN
+                    value_states_split[split_idx], self.value_mem = self.RNN_value(unshape(value_states_split[split_idx]), self.value_mem)
+                if self.recur_select==0 or self.recur_select==1:
+                    if self.concat_mem==True:
+                        value_states_split[split_idx]= torch.cat((shape(value_states_split[split_idx]),value_states_ori[split_idx]),dim=2)
+                    else:
+                        value_states_split[split_idx]= shape(value_states_split[split_idx])+value_states_ori[split_idx]
+                else:
+                    if self.concat_mem==True:
+                        value_states_split[split_idx]= torch.cat((value_states_split[max(0,split_idx-1)],value_states_ori[split_idx]),dim=2)
+               
+
+                attn_output = torch.matmul(
+                    attn_weights, value_states_split[split_idx] )
+        elif self.sparse==True: #TODO: convert to sparse matrix
             #TODO: reduce length of attention weights from bnqk to bnqs
             '''
             attn_weights_th = attn_weights.reshape(batch_size,self.n_heads*hidden_states.size(1), key_length)
@@ -1361,25 +1641,26 @@ class T5Attention(nn.Module):
             #current_value = value_states[:,:,-1,:].view(batch_size,self.n_heads,1,-1)
             #current_value = current_value.transpose(3,2)
             
-            value_states_th = value_states #/ self.v_threshold
-            value_states_th= value_states_th.transpose(3, 2) #bnvd->bndv
-            value_states_th= value_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)v
+            value_states_th = value_states.clone() #/ self.v_threshold
+            value_states_th= unshape(value_states_th)#bnvd->bv(n*d)
+            #value_states_th= value_states_th.reshape(batch_size,self.inner_dim, -1) #b(n*d)v
             #print(value_states_th.shape)
-            
+            value_states_th = value_states_th.transpose(1,2)
+            '''
+            #print(self.real_key_length, value_states_th.shape, key_states_th.shape, select_index.shape)
             #TODO: set length
             #value_select=torch.zeros((batch_size,self.inner_dim, attn_select.size(3))).to(value_states.device)
             value_select=torch.zeros((batch_size,self.inner_dim, key_length)).to(value_states.device)
 
-            #print(value_select.shape)
             for i in range(batch_size):
                 #for j in range(self.n_heads):
                 value_select[i,:,:] = torch.index_select(value_states_th[i,:,:], dim=1, index=select_index[i,:])  
             value_select= value_select.reshape(batch_size,self.n_heads, self.key_value_proj_dim , -1)
             #add the current state on the diag
             #value_states = torch.cat((value_select,current_value), dim=3)
+            attn_output = torch.matmul(attn_weights, value_select.transpose(3, 2)) 
             '''
             #TODO:multiply with selected attention weights
-            #attn_output = torch.matmul(attn_weights, value_select.transpose(3, 2)) 
             attn_output=torch.zeros((batch_size,self.n_heads, real_seq_length, self.key_value_proj_dim)).to(value_states.device)
             value_t= value_states_th
             #recurrect spiking
@@ -1394,14 +1675,15 @@ class T5Attention(nn.Module):
  
                 attn_output= torch.matmul(attn_weights, value_select.transpose(3, 2))
             #attn_output = torch.matmul(attn_select, value_select.transpose(3, 2)) 
-            value_t = value_t.reshape(batch_size,self.n_heads, self.key_value_proj_dim, -1) 
-            value_states = value_t.transpose(2,3)
-            '''
+            #value_t = value_t.reshape(batch_size,self.n_heads, self.key_value_proj_dim, -1) 
+            #value_states = value_t.transpose(2,3)
+            
             #TODO: add a residual of Q
+            '''
             query_res, self.qh = self.RNN(unshape(query_states), self.qh)
             query_res = shape(query_res)
             attn_output = attn_output + query_res
-            
+            '''
         else:
             attn_output = torch.matmul(attn_weights, value_states) #(bnqk,bnvd)->(bnqd)
 
@@ -1422,9 +1704,9 @@ class T5Attention(nn.Module):
 
 
 class T5LayerSelfAttention(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False, use_mem=False): 
+    def __init__(self, config, has_relative_attention_bias=False, use_mem=False, split_crossattn=False): 
         super().__init__()
-        self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias, use_mem=use_mem)
+        self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias, use_mem=use_mem, split_crossattn=split_crossattn)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -1460,7 +1742,8 @@ class T5LayerSelfAttention(nn.Module):
 class T5LayerCrossAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.EncDecAttention = T5Attention(config, has_relative_attention_bias=False)
+        #TODO: set split_crossattn to true
+        self.EncDecAttention = T5Attention(config, has_relative_attention_bias=False, split_crossattn=True)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -1498,7 +1781,7 @@ class T5Block(nn.Module):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
-        self.use_mem = True #TODO: use spiking networks or not
+        self.use_mem = False #TODO: use spiking networks or not
         self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias,use_mem=(self.is_decoder and self.use_mem)))
         if self.is_decoder:
             self.layer.append(T5LayerCrossAttention(config))
@@ -1538,7 +1821,6 @@ class T5Block(nn.Module):
             cross_attn_past_key_value = past_key_value[2:]
         else:
             self_attn_past_key_value, cross_attn_past_key_value = None, None
-
 
         #start_time = time.time()
         self_attention_outputs = self.layer[0](
@@ -1594,6 +1876,135 @@ class T5Block(nn.Module):
                 hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
 
             # Combine self attn and cross attn key value states
+            if present_key_value_state is not None:
+                present_key_value_state = present_key_value_state + cross_attention_outputs[1]
+
+            # Keep cross-attention outputs and relative position weights
+            attention_outputs = attention_outputs + cross_attention_outputs[2:]
+
+        # Apply Feed Forward layer
+        hidden_states = self.layer[-1](hidden_states, t=t)
+
+        # clamp inf values to enable fp16 training
+        if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
+            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
+            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+        outputs = (hidden_states,)
+
+        if use_cache:
+            outputs = outputs + (present_key_value_state,) + attention_outputs
+        else:
+            outputs = outputs + attention_outputs
+
+        return outputs  # hidden-states, present_key_value_states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
+
+
+class T5SpikingBlock(nn.Module):
+    def __init__(self, config, has_relative_attention_bias=False):
+        super().__init__()
+        self.is_decoder = config.is_decoder
+        self.layer = nn.ModuleList()
+        self.use_mem = True #TODO: use spiking networks or not, if it's true, self-attention will not concatenate prev values
+        self.use_selfattn = False
+        if self.use_selfattn:
+            self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias,use_mem=(self.is_decoder and self.use_mem)))
+
+        if self.is_decoder:
+            self.layer.append(T5LayerCrossAttention(config))
+
+        #self.layer.append(T5LayerFF(config))
+        self.layer.append(T5LayerSpikingFF(config))
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_bias=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        encoder_decoder_position_bias=None,
+        layer_head_mask=None,
+        cross_attn_layer_head_mask=None,
+        past_key_value=None,
+        use_cache=False,
+        output_attentions=False,
+        return_dict=True,
+        t=0,#for decoder
+        max_length=200,
+    ):
+
+        if past_key_value is not None:
+            assert self.is_decoder, "Only decoder can use `past_key_values`"
+        
+            self_attn_past_key_value = past_key_value[:2]
+            cross_attn_past_key_value = past_key_value[2:]
+        else:
+            self_attn_past_key_value, cross_attn_past_key_value = None, None
+        
+
+        if self.use_selfattn:
+            self_attention_outputs = self.layer[0](
+                hidden_states,
+                attention_mask=attention_mask,
+                position_bias=position_bias,
+                layer_head_mask=layer_head_mask,
+                past_key_value=self_attn_past_key_value,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                t=t,
+                max_length=max_length,
+            )
+
+            #end_time = time.time()
+            #logger.info(f"self attention time={end_time-start_time}")
+            #output of self attention: (attn_output,) + (present_key_value_state,) + (position_bias,)
+
+            hidden_states, present_key_value_state = self_attention_outputs[:2]
+            attention_outputs = self_attention_outputs[2:] #bias
+        else:
+            
+            present_key_value_state = (None,None)
+            attention_outputs = (None,)
+        
+        # clamp inf values to enable fp16 training
+        if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
+            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
+            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+        do_cross_attention = self.is_decoder and encoder_hidden_states is not None
+        if do_cross_attention:
+            # the actual query length is unknown for cross attention
+            # if using past key value states. Need to inject it here
+            cross_id= int(self.use_selfattn==True)
+            
+            if present_key_value_state is not None and self.use_selfattn:
+                query_length = present_key_value_state[0].shape[2]
+            else:
+                query_length = t+1
+
+            #start_time = time.time()
+            cross_attention_outputs = self.layer[cross_id](
+                hidden_states,
+                key_value_states=encoder_hidden_states,
+                attention_mask=encoder_attention_mask,
+                position_bias=encoder_decoder_position_bias,
+                layer_head_mask=cross_attn_layer_head_mask,
+                past_key_value=cross_attn_past_key_value,
+                query_length=query_length,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+            #end_time = time.time()
+            #logger.info(f"cross_attention time={end_time-start_time}")
+            hidden_states = cross_attention_outputs[0]
+
+            # clamp inf values to enable fp16 training
+            if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
+                clamp_value = torch.finfo(hidden_states.dtype).max - 1000
+                hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+            
             if present_key_value_state is not None:
                 present_key_value_state = present_key_value_state + cross_attention_outputs[1]
 
@@ -1716,9 +2127,17 @@ class T5Stack(T5PreTrainedModel):
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
 
-        self.block = nn.ModuleList(
-            [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
-        )
+        if self.is_decoder:
+            self.block = nn.ModuleList(
+                []
+            )
+            for i in range(int(config.num_layers)):
+                #self.block.append(T5SpikingBlock(config, has_relative_attention_bias=bool(i == 0)))
+                self.block.append(T5Block(config, has_relative_attention_bias=bool(i == 0)))
+        else:
+            self.block = nn.ModuleList(
+                [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(int(config.num_layers))]
+            )
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -1815,7 +2234,7 @@ class T5Stack(T5PreTrainedModel):
         batch_size, seq_length = input_shape
 
         # required mask seq length can be calculated via length of past
-        mask_seq_length = past_key_values[0][0].shape[2] + seq_length if past_key_values is not None else seq_length
+        mask_seq_length = past_key_values[len(self.block)-1][0].shape[2] + seq_length if past_key_values is not None else seq_length
 
         if use_cache is True:
             assert self.is_decoder, f":obj:`use_cache` can only be set to `True` if {self} is used as a decoder"
@@ -1936,7 +2355,12 @@ class T5Stack(T5PreTrainedModel):
             # We share the position biases between the layers - the first layer store them
             # layer_outputs = hidden-states, key-value-states (self-attention position bias), (self-attention weights),
             # (cross-attention position bias), (cross-attention weights)
+            #TODO: use separate position biases for spiking/non-spiking layers
+            #if i== int(self.config.num_layers/2):
+            #    position_bias = None
+            #else:
             position_bias = layer_outputs[2]
+            
             if self.is_decoder and encoder_hidden_states is not None:
                 encoder_decoder_position_bias = layer_outputs[4 if output_attentions else 3]
             # append next layer key value states

@@ -22,6 +22,8 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
+
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, MSELoss
 
 from ...file_utils import (
@@ -230,6 +232,39 @@ class PositionwiseFF(nn.Module):
 
         return output
 
+#For spiking neural network
+class LinearSpike(torch.autograd.Function):
+    """
+    Here we use the piecewise-linear surrogate gradient as was done
+    in Bellec et al. (2018).
+    """
+    gamma = 0.3 # Controls the dampening of the piecewise-linear surrogate gradient
+
+    @staticmethod
+    def forward(ctx, input):
+        
+        ctx.save_for_backward(input)
+        out = torch.zeros_like(input).cuda()
+        out[input > 0] = 1.0 #input[input > 0] #1.0 #TODO: binary spike or full-precision?
+        #out[input> 1.0] = 1.0
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        
+        input,     = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        #equation 3:if out[input>1]=1, out[0<input<1]=input
+        #grad = LinearSpike.gamma*F.threshold(1.0-torch.abs(2.0*input-1.0), 0, 0)
+
+        #equation 2: if out[input>0]=input
+        #grad = torch.zeros_like(input).cuda()
+        #grad [input > 0]      = 1.0
+        #grad       = LinearSpike.gamma*F.threshold(input, 0, 0)
+
+        #equation 1: if out[input>0]=1
+        grad       = LinearSpike.gamma*F.threshold(1.0-torch.abs(input), 0, 0)
+        return grad*grad_input, None
 
 class RelPartialLearnableMultiHeadAttn(nn.Module):
     def __init__(
@@ -271,6 +306,13 @@ class RelPartialLearnableMultiHeadAttn(nn.Module):
             self.r_w_bias = r_w_bias
 
         self.r_net = nn.Linear(self.d_model, self.n_head * self.d_head, bias=False)
+        #TODO: spiking
+        '''
+        self.act = LinearSpike.apply
+        self.threshold = nn.Parameter(0.1*torch.ones(1))
+        self.leak = nn.Parameter(0.8*torch.ones(1))
+        self.spiking_rate =0.0
+        '''
 
     def _rel_shift(self, x):
         zero_pad_shape = (x.size(0), 1) + x.size()[2:]
@@ -288,7 +330,34 @@ class RelPartialLearnableMultiHeadAttn(nn.Module):
         qlen, rlen, bsz = w.size(0), r.size(0), w.size(1)
 
         if mems is not None:
+            
+            #Note: if put SNN here, each layer can train a threshold/leak, but the new_mem is not kept, it just goes through qkv_net
+            #print('mem length & w length', mems.size(0), w.size(0))
+            #Pad zeros to w to make sure it has the same size as mems
+            '''
+            if mems.size(0)!=w.size(0):
+                zero_size = torch.Size([mems.size(0)- w.size(0) ]) + mems.size()[1:]
+                zero_pad = torch.zeros(zero_size, device=mems.device, dtype=mems.dtype)
+                w_padded = torch.cat([zero_pad,w], 0)
+                #TODO: add spiking neurons here
+                out_mems = self.leak * mems + w_padded
+            else:
+                out_mems = self.leak * mems + w
+            
+            out_mems = self.leak * mems
+            
+            new_spike  = out_mems / self.threshold - 1.0
+            rst = self.threshold * (new_spike>0).float()
+            out_mems = out_mems - rst
+
+            spike_act = self.act(new_spike)
+
+            self.spiking_rate= torch.count_nonzero(spike_act)/(spike_act.shape[0]*spike_act.shape[1]*spike_act.shape[2])
+            cat = torch.cat([spike_act, w], 0)
+            '''
+            out_mems= mems
             cat = torch.cat([mems, w], 0)
+            
             if self.pre_lnorm:
                 w_heads = self.qkv_net(self.layer_norm(cat))
             else:
@@ -370,6 +439,10 @@ class RelPartialLearnableMultiHeadAttn(nn.Module):
         if output_attentions:
             outputs.append(attn_prob)
 
+        #TODO:output mems
+        if mems is not None:
+            outputs.append(out_mems)
+
         return outputs
 
 
@@ -396,7 +469,7 @@ class RelPartialLearnableDecoderLayer(nn.Module):
         )
         ff_output = self.pos_ff(attn_outputs[0])
 
-        outputs = [ff_output] + attn_outputs[1:]
+        outputs = [ff_output] + attn_outputs[1:]# TODO: output mems
 
         return outputs
 
@@ -819,6 +892,13 @@ class TransfoXLModel(TransfoXLPreTrainedModel):
         else:  # learnable embeddings and absolute embeddings
             raise NotImplementedError  # Removed these to avoid maintaining dead code - They are not used in our pretrained checkpoint
 
+
+        #TODO: spiking
+        '''
+        self.act = LinearSpike.apply
+        self.threshold = nn.Parameter(0.1*torch.ones(1))
+        self.leak = nn.Parameter(0.5*torch.ones(1))
+        '''
         self.init_weights()
 
     def get_input_embeddings(self):
@@ -857,14 +937,35 @@ class TransfoXLModel(TransfoXLPreTrainedModel):
         # mems is not None
         assert len(hids) == len(mems), "len(hids) != len(mems)"
 
+        #print('mem length & w length', mems[0].size(0), hids[0].size(0))
+
         # There are `mlen + qlen` steps that can be cached into mems
         with torch.no_grad():
             new_mems = []
             end_idx = mlen + max(0, qlen)
             beg_idx = max(0, end_idx - self.mem_len)
             for i in range(len(hids)):
+                #TODO: add spiking neurons here
+                '''
 
+                if mems[i].size(0)!=hids[i].size(0):
+                    zero_size = torch.Size([mems[i].size(0)- hids[i].size(0) ]) + mems[i].size()[1:]
+                    zero_pad = torch.zeros(zero_size, device=mems[i].device, dtype=mems[i].dtype)
+                    h_padded = torch.cat([zero_pad,hids[i]], 0)
+                    #TODO: add spiking neurons here
+                    mem = self.leak * mems[i] + h_padded
+                else:
+                    mem = self.leak * mems[i] + hids[i]
+                
+                new_spike  = mem/ self.threshold - 1.0
+                rst = self.threshold * (new_spike>0).float()
+                mem = mem - rst
+
+                new_mem = self.act(new_spike)
+                cat = torch.cat([new_mem, hids[i]], 0)
+                '''
                 cat = torch.cat([mems[i], hids[i]], dim=0)
+
                 new_mems.append(cat[beg_idx:end_idx].detach())
 
         return new_mems
@@ -970,6 +1071,9 @@ class TransfoXLModel(TransfoXLPreTrainedModel):
                 core_out = layer_outputs[0]
                 if output_attentions:
                     attentions.append(layer_outputs[1])
+                #TODO:update mems
+                if mems is not None:
+                    mems[i]=layer_outputs[1]
         else:  # learnable embeddings and absolute embeddings
             raise NotImplementedError  # Removed these to avoid maintaining dead code - They are not used in our pretrained checkpoint
 

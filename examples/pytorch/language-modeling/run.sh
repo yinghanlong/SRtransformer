@@ -1,1 +1,3 @@
 python examples/pytorch/language-modeling/run_clm_no_trainer.py     --dataset_name wikitext     --dataset_config_name wikitext-103-raw-v1     --model_name_or_path gpt2     --output_dir ./results/causal-lm/ --gpus=3
+
+python examples/pytorch/language-modeling/run_clm_no_trainer.py     --dataset_name wikitext     --dataset_config_name wikitext-103-raw-v1     --model_name_or_path transfo-xl-wt103     --output_dir ./results/causal-lm/transfoxl/ --gpus=1 --per_device_train_batch_size 4 --per_device_eval_batch_size 4

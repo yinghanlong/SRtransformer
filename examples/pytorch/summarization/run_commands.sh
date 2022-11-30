@@ -57,3 +57,5 @@ python examples/pytorch/summarization/run_summarization_no_trainer.py  \
  --gpus =2
 
 python examples/pytorch/summarization/run_summarization_no_trainer.py     --model_name_or_path ./results/t5-small/2022-06-30-15-11/pytorch_model.bin  --config_name ./results/t5-small/2022-06-30-15-11/config.json --tokenizer_name=t5-small --dataset_name cnn_dailymail     --dataset_config "3.0.0"   --source_prefix "summarize: "     --output_dir ./results/t5-small/     --per_device_train_batch_size=16     --per_device_eval_batch_size=16     --num_train_epochs=10  --gpus=1 --evaluation_only=True
+
+python examples/pytorch/summarization/run_summarization_no_trainer.py     --model_name_or_path ./results/t5-small/cross-attn-rnn-concat/pytorch_model.bin --config_name ./results/t5-small/cross-attn-rnn-concat/config.json --tokenizer_name=t5-small    --dataset_name ccdv/cnn_dailymail     --dataset_config "3.0.0"   --source_prefix "summarize: "     --output_dir ./results/t5-small/     --per_device_train_batch_size=16     --per_device_eval_batch_size=16     --num_train_epochs=12  --gpus=2
