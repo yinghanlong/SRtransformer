@@ -562,12 +562,12 @@ def main():
     use_mem = False #TODO: set to true for spiking networks
     ffn_spike= False
     attn_spike= False
-    cross_spike = False
+    cross_spike = True
     ffn_id = 1
     
     for epoch in range(args.num_train_epochs):
-        logger.info(f"Splitting encoded features in cross attention. Padded to N*split_size. Baseline no spiking")
-        logger.info(f"Use RNN for cross-attention; SIZE=8. Concat its output with originial input")
+        logger.info(f"SIZE=8. Splitting encoded features in cross attention. Padded to N*split_size. Baseline no spiking. ")
+        logger.info(f"Relu SNN. Scale down by divide by norm(K). Approximate Q*K*V by q*Ks*Ks+q*Km*Vm; SNN applied on [KmVm].  ")
         if use_mem:
             #logger.info(f"Using pos/neg spikes; half spiking FFN T5 blocks without selfattention. Threshold init=0.1, leak=0.5")
             #logger.info(f"LinearSpike func: x=1 if x>1, x=x if 0<x<1. Init thre=0.1. global SNN with a linear layer outside of loop Before proj on key/value with leak and reset")
