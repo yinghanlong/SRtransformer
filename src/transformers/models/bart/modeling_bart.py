@@ -133,6 +133,7 @@ class BartAttention(nn.Module):
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
+        split_crossattn=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -150,6 +151,19 @@ class BartAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
+        #TODO:Set to true to split encoded features into segments for cross-attention
+        self.split_crossattn = split_crossattn 
+        if self.split_crossattn==True:
+            self.split_size= 64 #set to 8, 16, 64
+            self.SNN_kv = nn.Linear(self.head_dim, self.head_dim, bias=False)
+            self.recur_select= 0 #set to 0 for SNN, 1 for RNN, 2 for none      
+            self.concat_mem = False
+            self.enable_ksvs = True
+            self.threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
+            self.leak  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
+            logger.info(f"Splitting encoded features in cross attention, size= {self.split_size}, recur_select={self.recur_select}")
+
+
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
@@ -161,14 +175,23 @@ class BartAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        t=0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
-
+             
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         is_cross_attention = key_value_states is not None
         bsz, tgt_len, embed_dim = hidden_states.size()
 
+        #TODO
+        if t==0: #initialize memory neurons
+            if self.split_crossattn==True:
+                self.old_idx = -1
+
+                if self.recur_select==0: #SNN
+                    self.snn_mem = torch.zeros(bsz* self.num_heads, self.head_dim, self.head_dim).to(hidden_states.device)
+               
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
         # get key, value proj
@@ -207,20 +230,64 @@ class BartAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
+        def RAF_apply(input_states, Vmem, layer, threshold, leak, mem_layer=None):
+            #Vmem = leak * (mem_layer(Vmem.transpose(-2,-1)).transpose(-2,-1)) + layer(input_states)
+            x=layer(input_states)
+            Vmem = leak * Vmem + x
+            mem_thr = Vmem / threshold - 1.0
+            rst = threshold * (mem_thr>0).float()
+            Vmem = Vmem - rst
+
+            out = nn.functional.relu(mem_thr)
+            #out = self.act_func(mem_thr)
+            self.spiking_rate= torch.count_nonzero(out)/(out.shape[0]*out.shape[1]*out.shape[2])
+
+            return out, Vmem
+
+        #TODO: add segmented attention
+        if self.split_crossattn==True:
+            #pad with zero
+            if key_states.shape[1] % self.split_size != 0:
+                #print("****padding encoded keys****", key_states.shape)
+                pad_size = self.split_size* math.ceil(key_states.shape[1]/self.split_size) - key_states.shape[1]
+                key_states = nn.functional.pad(key_states, (0,0,0, pad_size), "constant",0)
+                #print("****padded encoded keys****",pad_size, key_states.shape)
+        
+            #split into chunks and store in a list, (b*n)kd-> q(b*nmd), m=split_size
+            key_states_split = torch.split(key_states, self.split_size, dim=1)
+            #key_states_split = list(key_states_split)
+            #key_states_ori = key_states_split.copy()
+
+            query_states_split = torch.split(query_states, 1, dim=1) #check size match
+            #multiply Q*K. ***Note: some keys are ignored if the length does not match
+            if self.training==True:
+                scores = [ torch.matmul(
+                    query_states_split[i], key_states_split[min(len(key_states_split)-1, int(i*len(key_states_split)/len(query_states_split)))].transpose(1, 2)
+                ) for i in range(len(query_states_split))]
+                
+                attn_weights = torch.stack(scores,dim=1)
+                #attn_weights = torch.squeeze(attn_weights, dim=-2) #bnqd
+                
+            else: #inference
+                split_idx= min( int(t*len(key_states_split)/128), len(key_states_split)-1)
+                attn_weights = torch.matmul(
+                    query_states, key_states_split[split_idx].transpose(1, 2) )
+        else:
+            attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        '''
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is {attn_weights.size()}"
             )
-
+        '''
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, tgt_len, src_len):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, -1) + attention_mask.to(attn_weights.device)[:,:,:,:attn_weights.shape[-1]]
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, -1)
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -229,26 +296,114 @@ class BartAttention(nn.Module):
                 raise ValueError(
                     f"Head mask for a single layer should be of size {(self.num_heads,)}, but is {layer_head_mask.size()}"
                 )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, -1)
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, -1)
 
         if output_attentions:
             # this operation is a bit awkward, but it's required to
             # make sure that attn_weights keeps its gradient.
             # In order to do so, attn_weights have to be reshaped
             # twice and have to be reused in the following
-            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
+            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, -1)
+            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, -1)
         else:
             attn_weights_reshaped = None
 
         attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
-        attn_output = torch.bmm(attn_probs, value_states)
+        #TODO: add segmented attention
+        if self.split_crossattn==True:
 
-        if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
+            #pad with zero
+            if value_states.shape[1] % self.split_size != 0:
+                pad_size = self.split_size* math.ceil(value_states.shape[1]/self.split_size) - value_states.shape[1]
+                value_states = nn.functional.pad(value_states, (0,0,0, pad_size), "constant",0)
+            
+            #split into chunks and store in a list
+            value_states_split = torch.split(value_states, self.split_size, dim=1)
+            #value_states_split = list(value_states_split)
+            #value_states_ori = value_states_split.copy()
+            #check size match
+            assert len(value_states_split)== len(key_states_split)
+
+            if self.training==True:
+                attn_weights_split = torch.split(attn_probs, 1, dim=1)
+                #split_len= min(len(value_states_split), len(attn_weights_split))
+                #TODO: multiply Ks*Vs, then approximate the missing part
+                if self.enable_ksvs==True:
+                    attn_output = []
+                    attn_complement= []
+                    self.kv_mem = torch.matmul(key_states.transpose(1,2), value_states)
+                    #TODO: precompute linear(ksvs), range=num of segments
+                    ksvs = [self.SNN_kv(torch.matmul(key_states_split[j].transpose(1,2), value_states_split[j])) for j in range(len(value_states_split))] #bnds * bnsd= m[bndd]
+                    
+                    for i in range(len(attn_weights_split)): #range = q
+                        idx= min(len(value_states_split)-1, int(i*len(value_states_split)/len(attn_weights_split)))
+                        #if self.old_idx != idx: #skip if segment idx not changed
+                        #    self.ksvs = torch.matmul(key_states_split[idx].transpose(1,2), value_states_split[idx]) #bnds * bnsd= bndd
+                        
+                        if self.recur_select==0:
+                            kmvm = self.kv_mem - ksvs[idx]
+                            #RAF
+                            kmvm, self.snn_mem = RAF_apply(kmvm, self.snn_mem, self.SNN_kv, self.threshold, self.leak)
+                            
+                            attn_complement = torch.matmul(query_states_split[i], kmvm) #b*n1d * b*ndd = b*n1d
+                            
+                            #scale it by dividing norm of K
+                            attn_complement = torch.div(attn_complement, torch.norm(key_states, dim=1).unsqueeze(1))#b*n kd
+                            
+                        else:
+                            kmvm = self.kv_mem - self.ksvs
+                            attn_complement = torch.matmul(query_states_split[i], kmvm)#scale it by dividing norm of K
+                            attn_complement = torch.div(attn_complement, torch.norm(key_states, dim=1).unsqueeze(1))
+                            
+                        #add complement to KsVs
+                        attn_output.append( torch.matmul(attn_weights_split[i], value_states_split[idx]) + attn_complement )
+                        self.old_idx = idx
+                else:
+                    attn_output = [ torch.matmul(
+                        attn_weights_split[i], value_states_split[min(len(value_states_split)-1, int(i*len(value_states_split)/len(attn_weights_split)))]
+                    ) for i in range(len(attn_weights_split))]
+                
+                attn_output = torch.stack(attn_output, dim=1)
+                attn_output = torch.squeeze(attn_output)
+            
+            else: #inference
+                split_idx= min(int(t*len(value_states_split)/128), len(key_states_split)-1)
+                if t==0:
+                    self.kv_mem = torch.matmul(key_states.transpose(1,2), value_states)
+                if self.enable_ksvs==True:
+                    #Approximate by a complementary matrix multiplicaion
+                    if self.old_idx != split_idx: #skip if segment idx not changed
+                        self.ksvs = torch.matmul(key_states_split[split_idx].transpose(1,2), value_states_split[split_idx]) #bnds * bnsd= bndd
+                    #TODO: use SNN here
+                    if self.recur_select==0:
+                        kmvm = self.kv_mem - self.ksvs
+                        kmvm, self.snn_mem = RAF_apply(kmvm, self.snn_mem, self.SNN_kv, self.threshold, self.leak)
+                        
+                        attn_complement = torch.matmul(query_states, kmvm) #1d * dd = 1d
+
+                        #normalize
+                        attn_complement = torch.div(attn_complement, torch.norm(key_states, dim=1).unsqueeze(1))
+                        
+                    else:
+                        kmvm = self.kv_mem - self.ksvs
+                        attn_complement = torch.matmul(query_states, kmvm)
+                        attn_complement = torch.div(attn_complement, torch.norm(key_states, dim=1).unsqueeze(1))
+
+                    attn_output = torch.matmul( attn_probs, value_states_split[split_idx] ) +attn_complement
+                   
+                else:
+                    attn_output = torch.matmul(
+                        attn_probs, value_states_split[split_idx] )
+                self.old_idx = split_idx
+        else:
+            attn_output = torch.bmm(attn_probs, value_states)
+
+
+        if attn_output.size() != (bsz* self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is {attn_output.size()}"
+                f"`attn_output` should be of size {(bsz* self.num_heads, tgt_len, self.head_dim)}, but is {attn_output.size()}"
             )
 
         attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
@@ -344,11 +499,13 @@ class BartDecoderLayer(nn.Module):
         self.activation_dropout = config.activation_dropout
 
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        #TODO: cross attention
         self.encoder_attn = BartAttention(
             self.embed_dim,
             config.decoder_attention_heads,
             dropout=config.attention_dropout,
             is_decoder=True,
+            split_crossattn=True,
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
@@ -366,6 +523,7 @@ class BartDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
+        t=0,
     ):
         """
         Args:
@@ -416,6 +574,7 @@ class BartDecoderLayer(nn.Module):
                 layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=cross_attn_past_key_value,
                 output_attentions=output_attentions,
+                t=t,
             )
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
@@ -888,6 +1047,7 @@ class BartDecoder(BartPretrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        t=0,
     ):
         r"""
         Args:
@@ -991,6 +1151,7 @@ class BartDecoder(BartPretrainedModel):
             encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
         # embed positions
+        #TODO: modify for segmented attention
         positions = self.embed_positions(input_shape, past_key_values_length)
 
         hidden_states = inputs_embeds + positions
@@ -1060,6 +1221,7 @@ class BartDecoder(BartPretrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    t=t, #timestep
                 )
             hidden_states = layer_outputs[0]
 
@@ -1146,6 +1308,7 @@ class BartModel(BartPretrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        t=0,
     ):
 
         # different to other models, Bart automatically creates decoder_input_ids from
@@ -1192,6 +1355,7 @@ class BartModel(BartPretrainedModel):
             inputs_embeds=decoder_inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            t=t,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
@@ -1666,6 +1830,7 @@ class BartForCausalLM(BartPretrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        t=0,
     ):
         r"""
         Args:
@@ -1772,6 +1937,7 @@ class BartForCausalLM(BartPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            t=t,
         )
 
         logits = self.lm_head(outputs[0])

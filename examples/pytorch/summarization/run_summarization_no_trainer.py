@@ -218,13 +218,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=2,#8,
+        default=8,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=2,#8,
+        default=8,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -339,7 +339,9 @@ def main():
     # download the dataset.
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
+        #TODO: set dataset
+        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name, cache_dir='/local/a/long273/')#,download_mode='force_redownload')
+        #raw_datasets = load_dataset('gigaword', 'master',download_mode='force_redownload')# ignore_verfications=True
     else:
         data_files = {}
         if args.train_file is not None:
@@ -397,6 +399,7 @@ def main():
     column_names = raw_datasets["train"].column_names
 
     # Get the column names for input/target.
+    logging.info("dataset name:", args.dataset_name)
     dataset_columns = summarization_name_mapping.get(args.dataset_name, None)
     if args.text_column is None:
         text_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
@@ -407,6 +410,7 @@ def main():
                 f"--text_column' value '{args.text_column}' needs to be one of: {', '.join(column_names)}"
             )
     if args.summary_column is None:
+        print("dataset column names",column_names)
         summary_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
     else:
         summary_column = args.summary_column
@@ -562,12 +566,18 @@ def main():
     use_mem = False #TODO: set to true for spiking networks
     ffn_spike= False
     attn_spike= False
-    cross_spike = True
+    cross_spike = False
     ffn_id = 1
+    if 'bart' in args.model_name_or_path:
+        num_layers= config.decoder_layers
+    else:
+        num_layers= config.num_layers
+    
     
     for epoch in range(args.num_train_epochs):
-        logger.info(f"SIZE=8. Splitting encoded features in cross attention. Padded to N*split_size. Baseline no spiking. ")
-        logger.info(f"Relu SNN. Scale down by divide by norm(K). Approximate Q*K*V by q*Ks*Ks+q*Km*Vm; SNN applied on [KmVm].  ")
+        logger.info(f"SIZE=64. Splitting encoded features in cross attention. Padded to N*split_size. ")
+        logger.info(f"BART split_crossattn=true. enabled Proposed kmvm with RAF")
+        #logger.info(f"Relu SNN. Approximate Q*K*V by q*Ks*Ks+q*Km*Vm; SNN applied on [KmVm].  ")
         if use_mem:
             #logger.info(f"Using pos/neg spikes; half spiking FFN T5 blocks without selfattention. Threshold init=0.1, leak=0.5")
             #logger.info(f"LinearSpike func: x=1 if x>1, x=x if 0<x<1. Init thre=0.1. global SNN with a linear layer outside of loop Before proj on key/value with leak and reset")
@@ -582,7 +592,7 @@ def main():
             #logger.info(f"Put mem_func ahead of spiking. Attn_out=(Q*Ks)*Vs+ rnn(Q).Timestep=1. Using seq-based sparse activation on keys/values! set size=32. Use an act_sparse_func")
             logger.info(f"Connect type={model.module.decoder.block[0].layer[0].SelfAttention.connect_type}")
             #logger.info(f"Using {model.module.decoder.block[0].layer[0].SelfAttention.window_size} recurrent spiking mem gate!")
-        avg_spiking_rate= torch.zeros(config.num_layers)
+        avg_spiking_rate= torch.zeros(num_layers)
         if (args.evaluation_only==False):
             model.train()
             total_steps=0
@@ -612,8 +622,10 @@ def main():
                 #calculate average spiking rates
 
                 if step%log_step==1:
-                    for i in range(0,int(config.num_layers)):
+                    for i in range(0,int(num_layers)):
                         print('loss ', loss)
+                        if 't5' in args.model_name_or_path:
+                            print('target len, key len',i,model.module.decoder.block[i].layer[1].EncDecAttention.gen_len, model.module.decoder.block[i].layer[1].EncDecAttention.key_length)
                         if ffn_spike==True:
                                 
                             print('spiking rate of ffn layer ',i,model.module.decoder.block[i].layer[ffn_id].DenseReluDense.spiking_rate.cpu())
@@ -621,10 +633,17 @@ def main():
                             print('ffn leak=',torch.mean(model.module.decoder.block[i].layer[ffn_id].DenseReluDense.leak)) 
                             avg_spiking_rate[i]+=model.module.decoder.block[i].layer[ffn_id].DenseReluDense.spiking_rate.cpu()
                         if cross_spike==True:
-                            print('spiking rate of ffn layer ',i,model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu())
-                            print('ffn threshold=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.threshold))
-                            print('ffn leak=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.leak)) 
-                            avg_spiking_rate[i]+=model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu()
+                            if 'bart' in args.model_name_or_path:
+                                print('spiking rate of layer ',i,model.module.model.decoder.layers[i].encoder_attn.spiking_rate.cpu())
+                                print('threshold=',torch.mean(model.module.model.decoder.layers[i].encoder_attn.threshold))
+                                print('leak=',torch.mean(model.module.model.decoder.layers[i].encoder_attn.leak)) 
+                                avg_spiking_rate[i]+=model.module.model.decoder.layers[i].encoder_attn.spiking_rate.cpu()
+                            else:
+                                
+                                print('spiking rate of layer ',i,model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu())
+                                print('threshold=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.threshold))
+                                print('leak=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.leak)) 
+                                avg_spiking_rate[i]+=model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu()
                         if attn_spike==True:
                             print('key spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
                             print('value spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.v_spiking_rate.cpu())
@@ -651,16 +670,20 @@ def main():
             "num_beams": args.num_beams,
             "use_cache": use_cache,
         }
-        avg_spiking_rate= torch.zeros(config.num_layers)
+        avg_spiking_rate= torch.zeros(num_layers)
         total_steps=0
 
-        for i in range(0,int(config.num_layers)):
+        for i in range(0,int(num_layers)):
             if ffn_spike:
                 logger.info(f"threshold={model.module.decoder.block[i].layer[ffn_id].DenseReluDense.threshold}")
                 logger.info(f"leak={model.module.decoder.block[i].layer[ffn_id].DenseReluDense.leak}")
             if cross_spike:
-                logger.info(f"threshold={model.module.decoder.block[i].layer[1].EncDecAttention.threshold}")
-                logger.info(f"leak={model.module.decoder.block[i].layer[1].EncDecAttention.leak}")
+                if 'bart' in args.model_name_or_path:
+                    logger.info(f"threshold={model.module.model.decoder.layers[i].encoder_attn.threshold}")
+                    logger.info(f"leak={model.module.model.decoder.layers[i].encoder_attn.leak}")
+                else:
+                    logger.info(f"threshold={model.module.decoder.block[i].layer[1].EncDecAttention.threshold}")
+                    logger.info(f"leak={model.module.decoder.block[i].layer[1].EncDecAttention.leak}")
             if attn_spike:
                 logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
                 logger.info(f"leak={model.module.decoder.block[i].layer[0].SelfAttention.leak}")
@@ -668,14 +691,14 @@ def main():
             with torch.no_grad():
                 generated_tokens = model.module.generate(#accelerator.unwrap_model(model).generate(
                     batch["input_ids"].to(args.device),
-                    attention_mask=batch["attention_mask"],
+                    attention_mask=batch["attention_mask"].to(args.device),
                     **gen_kwargs,
                 )
                 #calculate average spiking rates
                 if step%eval_log_step==0:
                     end_time = time.time()
                     logger.info(f"time to eval {step} steps from start={end_time-eval_time}")
-                    for i in range(0,int(config.num_layers)):
+                    for i in range(0,int(num_layers)):
                         #if use_mem==True:
                             #logger.info(f"reduce length to={model.module.decoder.block[i].layer[0].SelfAttention.key_length, model.module.decoder.block[i].layer[0].SelfAttention.real_key_length}")
                         
@@ -684,9 +707,14 @@ def main():
                             print('ffn threshold=',torch.mean(model.module.decoder.block[i].layer[ffn_id].DenseReluDense.threshold))
                             avg_spiking_rate[i]+=model.module.decoder.block[i].layer[ffn_id].DenseReluDense.spiking_rate.cpu()
                         if cross_spike:
-                            print('spiking rate of cross layer ',i,model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu())
-                            print('cross threshold=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.threshold))
-                            avg_spiking_rate[i]+=model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu()
+                            if 'bart' in args.model_name_or_path:
+                                print('spiking rate of cross layer ',i,model.module.model.decoder.layers[i].encoder_attn.spiking_rate.cpu())
+                                print('cross threshold=',torch.mean(model.module.model.decoder.layers[i].encoder_attn.threshold))
+                                avg_spiking_rate[i]+=model.module.model.decoder.layers[i].encoder_attn.spiking_rate.cpu()
+                            else:
+                                print('spiking rate of cross layer ',i,model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu())
+                                print('cross threshold=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.threshold))
+                                avg_spiking_rate[i]+=model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu()
                         if attn_spike:
                             print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
                             print('value spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.v_spiking_rate.cpu())
