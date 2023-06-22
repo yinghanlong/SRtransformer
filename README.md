@@ -38,6 +38,7 @@ Some configurations such as the segment size can be set in the source file of mo
 ## Citation
 
 If you use this repo, please use the following citation:
+```
 @misc{long2023segmented,
       title={Segmented Recurrent Transformer: An Efficient Sequence-to-Sequence Model}, 
       author={Yinghan Long and Sayeed Shafayet Chowdhury and Kaushik Roy},
