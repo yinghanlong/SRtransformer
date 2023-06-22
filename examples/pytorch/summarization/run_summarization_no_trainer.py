@@ -33,8 +33,10 @@ from datasets import load_dataset, load_metric
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from datetime import datetime
+import wandb
 
 import transformers
+from transformers import EncoderDecoderModel
 from accelerate import Accelerator
 from filelock import FileLock
 from transformers import (
@@ -59,6 +61,7 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summ
 # You should update this to your particular problem to have better documentation of `model_type`
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
 
 try:
     nltk.data.find("tokenizers/punkt")
@@ -289,6 +292,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    wandb.login()
 
     if args.source_prefix is None and args.model_name_or_path in [
         "t5-small",
@@ -360,7 +364,10 @@ def main():
     if args.config_name:
         config = AutoConfig.from_pretrained(args.config_name)
     elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(args.model_name_or_path)
+        if args.model_name_or_path=='encoder-decoder':
+            config = AutoConfig.from_pretrained("gpt2")
+        else:      
+            config = AutoConfig.from_pretrained(args.model_name_or_path)
     else:
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
@@ -371,7 +378,10 @@ def main():
     elif args.config_name:
         tokenizer = AutoTokenizer.from_pretrained(args.config_name, use_fast=not args.use_slow_tokenizer)
     elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+        if args.model_name_or_path=='encoder-decoder': #use encoder tokenizer
+            tokenizer = AutoTokenizer.from_pretrained('t5-small', use_fast=not args.use_slow_tokenizer)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
@@ -379,18 +389,29 @@ def main():
         )
 
     if args.model_name_or_path:
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-        )
+        if args.model_name_or_path=='encoder-decoder':
+            #TODO: choose encoder / decoder
+            model = EncoderDecoderModel.from_encoder_decoder_pretrained('t5-small', 'gpt2')
+
+        elif 'encoder-decoder' in args.model_name_or_path:
+            model = EncoderDecoderModel.from_pretrained(args.model_name_or_path, from_tf=bool(".ckpt" in args.model_name_or_path))
+        else:
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                args.model_name_or_path,
+                from_tf=bool(".ckpt" in args.model_name_or_path),
+                config=config,
+            )
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForSeq2SeqLM.from_config(config)
+    if 'encoder-decoder' in args.model_name_or_path:
+        model.encoder.resize_token_embeddings(len(tokenizer))
+        model.decoder.resize_token_embeddings(len(tokenizer))
+    else:
+        model.resize_token_embeddings(len(tokenizer))
 
-    model.resize_token_embeddings(len(tokenizer))
-    if model.config.decoder_start_token_id is None:
-        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+#    if model.config.decoder_start_token_id is None:
+#        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
 
     prefix = args.source_prefix if args.source_prefix is not None else ""
 
@@ -399,7 +420,7 @@ def main():
     column_names = raw_datasets["train"].column_names
 
     # Get the column names for input/target.
-    logging.info("dataset name:", args.dataset_name)
+    logging.info(f"dataset name:{ args.dataset_name}")
     dataset_columns = summarization_name_mapping.get(args.dataset_name, None)
     if args.text_column is None:
         text_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
@@ -525,6 +546,9 @@ def main():
     model = model.to(args.device)
     print(model) #show layer names
 
+    #use wandb to record logging
+    wandb.init(project="summarization",config=config)
+
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
 
@@ -561,22 +585,25 @@ def main():
     if args.evaluation_only:
         args.num_train_epochs=1
 
-    log_step= 200
-    eval_log_step= 100
+    log_step= 500
+    eval_log_step= 200
     use_mem = False #TODO: set to true for spiking networks
     ffn_spike= False
     attn_spike= False
     cross_spike = False
     ffn_id = 1
-    if 'bart' in args.model_name_or_path:
+    if 'bart' in args.model_name_or_path or 'BART' in args.model_name_or_path:
         num_layers= config.decoder_layers
+    elif 'encoder-decoder' in args.model_name_or_path:
+        num_layers= config.n_layer
     else:
         num_layers= config.num_layers
     
     
     for epoch in range(args.num_train_epochs):
-        logger.info(f"SIZE=64. Splitting encoded features in cross attention. Padded to N*split_size. ")
-        logger.info(f"BART split_crossattn=true. enabled Proposed kmvm with RAF")
+        logger.info(f"bart size=64. TransfoXL! Splitting encoded features in cross attention. Padded to N*split_size. ")
+        #logger.info(f"BART. test use element wise multiply for RAF. clamp KV and KsVs by +-2. No cross mask. Test not using SNN_kv layer")
+        #logger.info(f"BART. Set initial leak to 0.5. Test SNN_kv bias=False. enable_ksvs=true****Compute ks*vs in advance; Only apply recurrence if segment changes; ****")
         #logger.info(f"Relu SNN. Approximate Q*K*V by q*Ks*Ks+q*Km*Vm; SNN applied on [KmVm].  ")
         if use_mem:
             #logger.info(f"Using pos/neg spikes; half spiking FFN T5 blocks without selfattention. Threshold init=0.1, leak=0.5")
@@ -622,10 +649,11 @@ def main():
                 #calculate average spiking rates
 
                 if step%log_step==1:
+                    print('loss ', loss)
+                    wandb.log({"loss":loss})
                     for i in range(0,int(num_layers)):
-                        print('loss ', loss)
-                        if 't5' in args.model_name_or_path:
-                            print('target len, key len',i,model.module.decoder.block[i].layer[1].EncDecAttention.gen_len, model.module.decoder.block[i].layer[1].EncDecAttention.key_length)
+                        #if 't5' in args.model_name_or_path:
+                        #    print('target len, key len',i,model.module.decoder.block[i].layer[1].EncDecAttention.gen_len, model.module.decoder.block[i].layer[1].EncDecAttention.key_length)
                         if ffn_spike==True:
                                 
                             print('spiking rate of ffn layer ',i,model.module.decoder.block[i].layer[ffn_id].DenseReluDense.spiking_rate.cpu())
@@ -637,12 +665,14 @@ def main():
                                 print('spiking rate of layer ',i,model.module.model.decoder.layers[i].encoder_attn.spiking_rate.cpu())
                                 print('threshold=',torch.mean(model.module.model.decoder.layers[i].encoder_attn.threshold))
                                 print('leak=',torch.mean(model.module.model.decoder.layers[i].encoder_attn.leak)) 
+                                #print('sigma=',model.module.model.decoder.layers[i].encoder_attn.sigma.cpu()) 
                                 avg_spiking_rate[i]+=model.module.model.decoder.layers[i].encoder_attn.spiking_rate.cpu()
                             else:
                                 
                                 print('spiking rate of layer ',i,model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu())
                                 print('threshold=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.threshold))
                                 print('leak=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.leak)) 
+                                #print('sigma=',model.module.decoder.block[i].layer[1].EncDecAttention.sigma.cpu()) 
                                 avg_spiking_rate[i]+=model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu()
                         if attn_spike==True:
                             print('key spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
@@ -711,10 +741,12 @@ def main():
                                 print('spiking rate of cross layer ',i,model.module.model.decoder.layers[i].encoder_attn.spiking_rate.cpu())
                                 print('cross threshold=',torch.mean(model.module.model.decoder.layers[i].encoder_attn.threshold))
                                 avg_spiking_rate[i]+=model.module.model.decoder.layers[i].encoder_attn.spiking_rate.cpu()
+                                #print('sigma=',model.module.model.decoder.layers[i].encoder_attn.sigma.cpu()) 
                             else:
                                 print('spiking rate of cross layer ',i,model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu())
                                 print('cross threshold=',torch.mean(model.module.decoder.block[i].layer[1].EncDecAttention.threshold))
                                 avg_spiking_rate[i]+=model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu()
+                                #print('sigma=',model.module.decoder.block[i].layer[1].EncDecAttention.sigma.cpu()) 
                         if attn_spike:
                             print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
                             print('value spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.v_spiking_rate.cpu())
@@ -757,6 +789,8 @@ def main():
 
         result = {k: round(v, 4) for k, v in result.items()}
 
+        wandb.log(result)
+
         logger.info(result)
         #only run evaluataion once
         if (args.evaluation_only):
@@ -768,7 +802,8 @@ def main():
             #unwrapped_model = accelerator.unwrap_model(model)
             #unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
             model.module.save_pretrained(args.output_dir)
-
+        
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

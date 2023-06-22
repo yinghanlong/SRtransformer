@@ -825,29 +825,22 @@ class T5Attention(nn.Module):
 
         #TODO:Set to true to split encoded features into segments for cross-attention
         self.split_crossattn = split_crossattn 
-        self.gen_len = 128 #For cnn-dailymail,decode_size=128. 
         if self.split_crossattn==True:
             self.act_func 	= LinearSpike.apply 
+            self.parallel = True # parallel local attention, and global attention
             self.split_size= 64 #For cnn-dailymail, use 8 because encode_size=1024, decode_size=128. If split_size=1024, it's not split
-            #self.mem_gate_k = nn.Linear(self.split_size, self.split_size, bias=False)
-            #self.mem_gate_v = nn.Linear(self.split_size, self.split_size, bias=False)
-            self.SNN_kv = nn.Linear(self.key_value_proj_dim, self.key_value_proj_dim, bias=False)
-            #self.SNN_kv = nn.Linear(self.key_value_proj_dim*self.key_value_proj_dim, self.key_value_proj_dim*self.key_value_proj_dim, bias=False)
-            #self.RNN_kv = nn.RNN(self.key_value_proj_dim*self.key_value_proj_dim, self.key_value_proj_dim*self.key_value_proj_dim, batch_first=True)
-            self.recur_select= 0 #set to 0 for SRformer, 1 for transfoXL, 2 for none      
-            self.concat_mem = False #set to True for transfoXL and longT5
-            self.enable_ksvs = True #set to True for SRformer
-            if self.recur_select==1:
-                self.RNN_key = nn.RNN(self.inner_dim, self.inner_dim, batch_first=True)
-                #self.SNN_key = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
-                #self.SNN_value = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
-                self.RNN_value = nn.RNN(self.inner_dim, self.inner_dim, batch_first=True)
-            #self.sigma  = torch.nn.Parameter( 0.5*torch.ones(1),requires_grad=True) #control the weights of segmented/recurrent attention
+            self.RNN_key = nn.RNN(self.inner_dim, self.inner_dim, batch_first=True)
+            self.SNN_key = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+            self.SNN_value = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+            self.RNN_value = nn.RNN(self.inner_dim, self.inner_dim, batch_first=True)
+            self.mem_gate_k = nn.Linear(self.split_size, self.split_size, bias=False)
+            self.mem_gate_v = nn.Linear(self.split_size, self.split_size, bias=False)
+            self.recur_select= 0 #set to 0 for SNN, 1 for RNN, 2 for none      
+            self.concat_mem = True
             self.threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
-            #self.scale  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
-            self.leak  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
-            #self.v_leak  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
-            #self.v_threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
+            self.leak  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
+            self.v_leak  = torch.nn.Parameter( torch.ones(1),requires_grad=True)
+            self.v_threshold  = torch.nn.Parameter( 0.1*torch.ones(1),requires_grad=True)
             logger.info(f"Splitting encoded features in cross attention, size= {self.split_size}, recur_select={self.recur_select}")
 
 
@@ -963,13 +956,13 @@ class T5Attention(nn.Module):
         real_seq_length = seq_length
         if t==0: #initialize spiking neurons
             if self.split_crossattn==True:
-                self.old_idx = -1
-                self.old_value_idx = -1
-
                 if self.recur_select==0: #SNN
+                    self.old_idx = -1
                     #self.key_mem = torch.zeros(batch_size, self.split_size, self.inner_dim).to(hidden_states.device)
-                    self.snn_mem = torch.zeros(batch_size, self.n_heads, self.key_value_proj_dim, self.key_value_proj_dim).to(hidden_states.device)
-                    #self.value_mem = torch.zeros(batch_size, self.split_size ,self.inner_dim).to(hidden_states.device)
+                    self.key_mem = [torch.zeros(batch_size, 1, self.inner_dim).to(hidden_states.device) for i in range(int(1024/self.split_size))]
+                    self.value_mem = [torch.zeros(batch_size, 1 ,self.inner_dim).to(hidden_states.device) for i in range(int(1024/self.split_size))]
+                    self.key_mem_all = torch.zeros(batch_size, 1, self.inner_dim).to(hidden_states.device)
+                    self.value_mem_all = torch.zeros(batch_size, 1 ,self.inner_dim).to(hidden_states.device)
                 elif self.recur_select==1: #RNN
                     self.key_mem = torch.zeros(1, batch_size, self.inner_dim).to(hidden_states.device)
                     self.value_mem = torch.zeros(1, batch_size, self.inner_dim).to(hidden_states.device)
@@ -1307,21 +1300,15 @@ class T5Attention(nn.Module):
 
             return out, Vmem
 
-        def RAF_apply(input_states, Vmem, layer, threshold, leak, mem_layer=None):
+        def SNN_apply(input_states, Vmem, layer, threshold, leak, mem_layer):
             #Vmem = leak * (mem_layer(Vmem.transpose(-2,-1)).transpose(-2,-1)) + layer(input_states)
-            #x=layer(input_states.view(batch_size, self.n_heads, -1))
-            #x= x.reshape(batch_size, self.n_heads, self.key_value_proj_dim, -1)
-            if layer==None:
-                x=input_states
-            else:
-                x=layer(input_states)
+            '''
+            x=layer(input_states)
             Vmem = leak * Vmem + x
             mem_thr = Vmem / threshold - 1.0
             rst = threshold * (mem_thr>0).float()
             Vmem = Vmem - rst
-
-            out = nn.functional.relu(mem_thr)
-            #out = self.act_func(mem_thr)
+            out = self.act_func(mem_thr)
             '''
             #inner loop for snn
             x=layer(input_states)
@@ -1332,15 +1319,15 @@ class T5Attention(nn.Module):
                 rst = threshold * (mem_thr>0).float()
                 Vmem = Vmem - rst
                 out[:,i,:] = self.act_func(mem_thr).squeeze(1)
-            '''
-            self.spiking_rate= torch.count_nonzero(out)/(out.shape[0]*out.shape[1]*out.shape[2]*out.shape[3])
+            
+            self.spiking_rate= torch.count_nonzero(out)/(out.shape[0]*out.shape[1]*out.shape[2])
 
             return out, Vmem
             
         #add recurrent gate before proj layers
         
         #q_hidden_states = torch.clone(hidden_states)
-        if self.use_mem: #disabled
+        if self.use_mem and False ==True: #disabled
             #batch, seq, dim
             #TODO: use SNN
             key_states, self.key_states_mem= spike_apply(hidden_states, self.key_states_mem, self.threshold, self.k_linear)
@@ -1403,79 +1390,86 @@ class T5Attention(nn.Module):
         self.key_length = key_length
         self.real_key_length = real_key_length
         
-        if self.training==True:
-            self.gen_len =query_states.shape[2]
+
         #TODO: split encoder features into segments
         if self.split_crossattn==True:
-            #start_time = time.time()
             #pad with zero
-            
             if key_states.shape[2] % self.split_size != 0:
                 #print("****padding encoded keys****", key_states.shape)
                 pad_size = self.split_size* math.ceil(key_states.shape[2]/self.split_size) - key_states.shape[2]
                 key_states = nn.functional.pad(key_states, (0,0,0, pad_size), "constant",0)
                 #print("****padded encoded keys****",pad_size, key_states.shape)
         
-            #split into chunks and store in a list, bnkd-> m(bnsd), s=split_size
+            #split into chunks and store in a list, bnkd-> q(bnmd), m=split_size
             key_states_split = torch.split(key_states, self.split_size, dim=2)
-            if self.concat_mem==True and self.recur_select==1:
-                key_states_split = list(key_states_split)
-                key_states_ori = key_states_split.copy() 
-
-            query_states_split = torch.split(query_states, 1, dim=2) #check size match
-            if self.concat_mem==True:
-                #TODO: CONCAT global tokens for global attention
-                global_token = [torch.mean(key_states_split[i], dim=2, keepdim=True) for i in range(len(key_states_split))] #m(bnsd)-> bnmd
-                global_token = torch.cat(global_token, dim=2)
-
+            key_states_split = list(key_states_split)
+            key_states_ori = key_states_split.copy()
             #multiply Q*K. ***Note: some keys are ignored if the length does not match
             if self.training==True:
-                self.gen_len =len(query_states_split)
+                query_states_split = torch.split(query_states, 1, dim=2) #check size match
                 #split_len= min(len(key_states_split), len(query_states_split))
                 #print(len(key_states_split),type(key_states_split),type(key_states_split[0]))
+                #TODO: make a global memory
+                self.key_mem_all = torch.zeros(batch_size, len(key_states_split) , self.inner_dim).to(hidden_states.device)
                 #SNN integrate and fire or RNN
-                #key_mem_all = []
-                
-                #transfoXL #bn1d
-                if self.recur_select==1:#RNN
-                    for i in range(len(key_states_split)):
-                        key_states_split[i], self.key_mem = self.RNN_key(unshape(key_states_split[i]), self.key_mem)
-                
-                #reshape and concat
-                if  self.recur_select==1:#transfoXL
-                    if self.concat_mem==True:
-                        #key_states_split = [ torch.cat((shape(key_mem_all[i]), shape(key_states_split[i])),dim=2) for i in range(len(key_states_split))]
-                        key_states_split = [ torch.cat((shape(key_states_split[max(0,i-1)]), key_states_ori[i]),dim=2) for i in range(len(key_states_split))]
-                else:#longt5
-                    if self.concat_mem==True:
-                        #TODO: CONCAT global tokens for global attention
-                        key_states_split = [ torch.cat((key_states_split[i], global_token),dim=2) for i in range(len(key_states_split))]
+                for i in range(len(key_states_split)):
 
+                    #bn1d
+                    if self.recur_select==0: #SNN, unshape to bk(n*d)
+                        key_states_split[i], key_mem_out = SNN_apply(unshape(key_states_split[i]), self.key_mem[i], self.SNN_key, self.threshold, self.leak, self.mem_gate_k)
+                    elif self.recur_select==1:#RNN
+                        key_states_split[i], key_mem_out = self.RNN_key(unshape(key_states_split[i]), self.key_mem[i])
+                    #TODO: add out key mem to attention
+                    if self.parallel==True:
+                        self.key_mem_all[:,i,:]= key_mem_out.squeeze(1)
+                    else:
+                        self.key_mem = key_mem_out
+                #reshape and concat
+                if self.recur_select==0 or self.recur_select==1:
+                    if self.concat_mem==True:
+                        key_states_split = [ torch.cat((shape(self.key_mem_all), shape(key_states_split[i])),dim=2) for i in range(len(key_states_split))]
+                        #key_states_split = [ torch.cat((shape(key_states_split[i]), key_states_ori[i]),dim=2) for i in range(len(key_states_split))]
+                    else:
+                        key_states_split = [shape(key_states_split[i])+key_states_ori[i] for i in range(len(key_states_split))]
+                else:
+                    if self.concat_mem==True:
+                        key_states_split = [ torch.cat((key_states_split[max(0,i-1)], key_states_ori[i]),dim=2) for i in range(len(key_states_split))]
+                    
                 scores = [ torch.matmul(
                     query_states_split[i], key_states_split[min(len(key_states_split)-1, int(i*len(key_states_split)/len(query_states_split)))].transpose(3, 2)
                 ) for i in range(len(query_states_split))]
-                
-                scores = torch.cat(scores,dim=2)
-                
+                scores = torch.stack(scores,dim=2)
+                scores= torch.squeeze(scores, dim=-2)
             else: #inference
-                split_idx= min( int(t*len(key_states_split)/self.gen_len), len(key_states_split)-1)
+                split_idx= min( int(t*len(key_states_split)/128), len(key_states_split)-1)
+                #TODO:SNN integrate and fire or RNN
+                #bn1d
+                if self.recur_select==0 and (self.old_idx != split_idx): #SNN
+                    key_states_split[split_idx], key_mem_out = SNN_apply(unshape(key_states_split[split_idx]), self.key_mem[split_idx], self.SNN_key,self.threshold, self.leak, self.mem_gate_k)
+                elif self.recur_select==1 and (self.old_idx != split_idx):#RNN
+                    key_states_split[split_idx], key_mem_out = self.RNN_key(unshape(key_states_split[split_idx]), self.key_mem[split_idx])
                 
-                #TODO:transfoXL #bn1d
-                if self.recur_select==1:#RNN
-                        sid= max(0,split_idx-1)
-                        key_states_split[sid], self.key_mem = self.RNN_key(unshape(key_states_split[sid]), self.key_mem)
-                
-                if self.concat_mem==True:
-                    if self.recur_select==1:#transfoXL
-                        key_states_cur = torch.cat( (shape(key_states_split[max(0,split_idx-1)]), key_states_ori[split_idx]),dim=2)
-                    else: #longt5
-                        #TODO: CONCAT global tokens for global attention
-                        key_states_cur = torch.cat((key_states_split[split_idx], global_token),dim=2) 
+                #TODO: add out key mem to attention
+                if self.parallel==True and (self.old_idx != split_idx): #end of a segment, change to the next one
+                    if t==0:
+                        self.key_mem_all =  key_mem_out
+                    else:
+                        self.key_mem_all = torch.cat((self.key_mem_all, key_mem_out),dim=1)
                 else:
-                    key_states_cur = key_states_split[split_idx]
+                    self.key_mem = key_mem_out
 
+                if self.recur_select==0 or self.recur_select==1:
+                    if self.concat_mem==True:
+                        key_states_split[split_idx] = torch.cat( (shape(self.key_mem_all),shape(key_states_split[split_idx])),dim=2)
+                        #key_states_split[split_idx] = torch.cat( (shape(key_states_split[split_idx]), key_states_ori[split_idx]),dim=2)
+                    else:
+                        key_states_split[split_idx] = shape(key_states_split[split_idx])+ key_states_ori[split_idx]
+                else:
+                    if self.concat_mem==True:
+                        key_states_split[split_idx] = torch.cat( (key_states_split[max(0,split_idx-1)], key_states_ori[split_idx]),dim=2)
+                
                 scores = torch.matmul(
-                    query_states, key_states_cur.transpose(3, 2) )
+                    query_states, key_states_split[split_idx].transpose(3, 2) )
                 self.old_idx = split_idx
             key_length = self.split_size
             self.key_length = key_length
@@ -1566,46 +1560,35 @@ class T5Attention(nn.Module):
         #TODO: set special position bias for split encoder features into segments
         elif self.split_crossattn==True:
             #print(scores.shape, position_bias.shape)
-            #end_time = time.time()
-            #logger.info(f"segmented atten time={end_time-start_time}")
-            #start_time = time.time()
+
             if position_bias.shape[-1]<scores.shape[-1]: #padding
                 position_bias =nn.functional.pad(position_bias, (0,scores.shape[-1]-position_bias.shape[-1]), "constant",0)
             if self.training==True:
-                #scores += position_bias
-                
                 for i in range(scores.shape[2]):
                     # im:(i+1)m
                     pidx = min(int(i*len(key_states_split)/scores.shape[2]), position_bias.shape[-1]//self.split_size-1)
                     pid = max(0,pidx-1)
-                    if self.concat_mem==True:
-                        if self.recur_select==0:#longt5
-                            #concat global bias
-                            pbias = torch.cat((position_bias[:,:,i, (pidx)*self.split_size: (pidx+1)*self.split_size],position_bias[:,:,i,::self.split_size]),dim=-1)
-                        else:#transfoXL
-                            pbias = torch.cat((position_bias[:,:,i, (pid)*self.split_size: (pid+1)*self.split_size], position_bias[:,:,i, (pidx)*self.split_size: (pidx+1)*self.split_size]),dim=-1)
+                    if self.parallel==True:
+                        #concat global and local bias, global one use step=split size
+                        pbias = torch.cat((position_bias[:,:,i, 0::self.split_size], position_bias[:,:,i, (pidx)*self.split_size: (pidx+1)*self.split_size]),dim=-1)
+                    elif self.concat_mem==True:
+                        pbias = torch.cat((position_bias[:,:,i, (pid)*self.split_size: (pid+1)*self.split_size], position_bias[:,:,i, (pidx)*self.split_size: (pidx+1)*self.split_size]),dim=-1)
                     else:
                         pbias =  position_bias[:,:,i, (pidx)*self.split_size: (pidx+1)*self.split_size]
                     #print(scores[:,:,i,:].shape,position_bias[:,:,i, pidx*self.split_size: (pidx+1)*self.split_size].shape)
-                    if pbias.shape[-1]<scores.shape[-1]: #padding
-                        pbias =nn.functional.pad(pbias, (0,scores.shape[-1]-pbias.shape[-1]), "constant",0)
                     scores[:,:,i,:] += pbias
-                
             else:
-                split_idx= min(int(t*len(key_states_split)/self.gen_len), len(key_states_split)-1) #int(t/self.split_size)
+                split_idx= min(int(t*len(key_states_split)/128), len(key_states_split)-1) #int(t/self.split_size)
                 sid= max(0, split_idx-1)
-                if self.concat_mem==True:
-                    if self.recur_select==0:#longt5
-                        #concat global bias
-                        pbias = torch.cat((position_bias[:,:,:, (split_idx)*self.split_size: (split_idx+1)*self.split_size],position_bias[:,:,:,::self.split_size]),dim=-1)
-                    else:#transfoXL
-                        pbias= torch.cat((position_bias[:,:,:, sid*self.split_size: (sid+1)*self.split_size],position_bias[:,:,:, (split_idx)*self.split_size: (split_idx+1)*self.split_size]),dim=-1)
+                #concat global and local bias, global one use step=split size
+                if self.parallel==True:
+                    pbias= torch.cat((position_bias[:,:,:, 0::self.split_size],position_bias[:,:,:, (split_idx)*self.split_size: (split_idx+1)*self.split_size]),dim=-1)
+                elif self.concat_mem==True:
+                    pbias= torch.cat((position_bias[:,:,:, sid*self.split_size: (sid+1)*self.split_size],position_bias[:,:,:, (split_idx)*self.split_size: (split_idx+1)*self.split_size]),dim=-1)
                 else:
                     pbias= position_bias[:,:,:, (split_idx)*self.split_size: (split_idx+1)*self.split_size]
                 
                 #print(scores.shape, position_bias.shape,split_idx)
-                if pbias.shape[-1]<scores.shape[-1]: #padding
-                    pbias =nn.functional.pad(pbias, (0,scores.shape[-1]-pbias.shape[-1]), "constant",0)
                 scores += pbias
         else:
             #key_length = scores.shape[3]
@@ -1624,168 +1607,89 @@ class T5Attention(nn.Module):
         if layer_head_mask is not None:
             attn_weights = attn_weights * layer_head_mask
 
+
         #TODO: split encoder features into segments
         if self.split_crossattn==True:
-            #end_time = time.time()
-            #logger.info(f"softmax time={end_time-start_time}")
-            #start_time = time.time()
-            #pad with zero            
+
+            #pad with zero
             if value_states.shape[2] % self.split_size != 0:
                 pad_size = self.split_size* math.ceil(value_states.shape[2]/self.split_size) - value_states.shape[2]
                 value_states = nn.functional.pad(value_states, (0,0,0, pad_size), "constant",0)
             
             #split into chunks and store in a list
             value_states_split = torch.split(value_states, self.split_size, dim=2)
-            if self.concat_mem==True and self.recur_select==1:
-                value_states_split = list(value_states_split)
-                value_states_ori = value_states_split.copy()
+            value_states_split = list(value_states_split)
+            value_states_ori = value_states_split.copy()
             #check size match
             assert len(value_states_split)== len(key_states_split)
 
-            if self.concat_mem==True:
-                #TODO: CONCAT global tokens for global attention
-                global_v = [torch.mean(value_states_split[i], dim=2, keepdim=True) for i in range(len(value_states_split))] #m(bnsd)-> bnmd
-                global_v= torch.cat(global_v, dim=2)
-
             if self.training==True:
-                attn_weights_split = torch.split(attn_weights, 1, dim=2)#bnqk->q(bnqk)
-
+                attn_weights_split = torch.split(attn_weights, 1, dim=2)
                 #split_len= min(len(value_states_split), len(attn_weights_split))
-                #TODO: multiply Ks*Vs, then approximate the missing part
-                if self.enable_ksvs==True:
-                    attn_output = []
-                    attn_complement= []
-                    self.kv_mem = torch.matmul(key_states.transpose(2,3), value_states)
-                    #TODO: precompute ksvs) range=num of segments
-                    ksvs = [torch.matmul(key_states_split[j].transpose(2,3), value_states_split[j]) for j in range(len(value_states_split))] #bnds * bnsd= m[bndd]
+                #TODO: make a global memory
+                self.value_mem_all = torch.zeros(batch_size, len(value_states_split) , self.inner_dim).to(hidden_states.device)
+                
+                #SNN integrate and fire or RNN
+                for i in range(len(value_states_split)):
                     
-                    for i in range(len(attn_weights_split)): #range =  q
-                        idx= min(len(value_states_split)-1, int(i*len(value_states_split)/len(attn_weights_split)))
-                        
-                        #if self.old_idx != idx: #skip if segment idx not changed
-                        #    ksvs = torch.matmul(key_states_split[idx].transpose(2,3), value_states_split[idx]) #bnds * bnsd= bndd
-                        
-                        #TODO: use SNN here
-                        if self.recur_select==0:
-                            #kmvm, self.kv_mem = SNN_apply(ksvs, self.kv_mem, self.SNN_kv, self.threshold, self.leak)
-                            #TODO:skip if idx stays the same
-                            if self.old_idx!=idx:
-                                #use precomputed ksvs
-                                kmvm = self.kv_mem - ksvs[idx]
-                                #RAF
-                                kmvm, self.snn_mem = RAF_apply(kmvm, self.snn_mem, self.SNN_kv, self.threshold, self.leak)
-                            
-                            #ksvs, self.snn_mem = SNN_apply(ksvs, self.snn_mem, self.SNN_kv, self.threshold, self.leak)
-                            #kmvm = torch.where(kv_mask>0, kmvm, kv_mask) #kmvm=torch.mul(ksvs, kmvm)
-                            attn_complement = torch.matmul(query_states_split[i], kmvm) #bn1d * bndd = bn1d
-                            #TODO: Test if use kv instead of kmvm
-                            #attn_complement = torch.matmul(query_states_split[i], self.kv_mem) #bn1d * bndd = bn1d
-
-                            #scale it by dividing norm of K
-                            attn_complement = torch.div(attn_complement, torch.norm(key_states, dim=2).unsqueeze(2))
-                            #TODO TEST: divide by q*norm(k)^T; bn1d/ (bn1d*bnd1)
-                            #norm_factor = torch.matmul(query_states_split[i], torch.norm(key_states, dim=2).unsqueeze(2).transpose(2,3) ) 
-                            #attn_complement = torch.div(attn_complement, norm_factor)
-                            #attn_complement, self.snn_mem = SNN_apply(attn_complement, self.snn_mem, self.SNN_kv, self.threshold, self.leak)
-                        elif self.recur_select==1:
-                            kmvm = self.kv_mem - self.ksvs
-                            attn_complement = torch.matmul(query_states_split[i], kmvm) #1d * dd = 1d
-                            attn_complement, self.rnn_mem = self.RNN_kv(attn_complement, self.rnn_mem)
-                        else:
-                            kmvm = self.kv_mem - self.ksvs
-                            attn_complement = torch.matmul(query_states_split[i], kmvm)#scale it by dividing norm of K
-                            attn_complement = torch.div(attn_complement, torch.norm(key_states, dim=2).unsqueeze(2))
-                            
-                        #TODO: test: only using complement, no KsVs
-                        attn_output.append( torch.matmul(attn_weights_split[i], value_states_split[idx]) + attn_complement )
-                        #attn_output.append( self.sigma*torch.matmul(attn_weights_split[i], value_states_split[idx]) + (1.0-self.sigma)*attn_complement )
-                        #attn_output.append(  attn_complement )
-                        self.old_idx = idx
+                    #bn1d
+                    if self.recur_select==0: #SNN
+                        value_states_split[i], value_mem_out = SNN_apply(unshape(value_states_split[i]), self.value_mem[i], self.SNN_value, self.v_threshold, self.v_leak,self.mem_gate_v)
+                    elif self.recur_select==1:#RNN
+                        value_states_split[i], value_mem_out = self.RNN_value(unshape(value_states_split[i]), self.value_mem[i])
+                    #TODO: add out key mem to attention
+                    if self.parallel==True:
+                        self.value_mem_all[:,i,:]= value_mem_out.squeeze(1)
+                    else:
+                        self.value_mem = value_mem_out
+                #reshape and concat the memory with current input
+                if self.recur_select==0 or self.recur_select==1:
+                    if self.concat_mem==True:
+                        value_states_split = [ torch.cat((shape(self.value_mem_all),shape(value_states_split[i])),dim=2) for i in range(len(value_states_split))]
+                        #value_states_split = [ torch.cat((shape(value_states_split[i]), value_states_ori[i]),dim=2) for i in range(len(value_states_split))]
+                    else:
+                        value_states_split = [ shape(value_states_split[i])+ value_states_ori[i] for i in range(len(value_states_split))]
                 else:
                     if self.concat_mem==True:
-                        if self.recur_select==0: #longt5
-                            #TODO: CONCAT global tokens for global attention
-                            value_states_split = [ torch.cat((value_states_split[i], global_v),dim=2) for i in range(len(value_states_split))]
-                        else: #TransfoXL
-                            for i in range(len(value_states_split)):
-                                #bn1d
-                                value_states_split[i], self.value_mem = self.RNN_value(unshape(value_states_split[i]), self.value_mem)
-                        
-                            #reshape and concat the memory with current input
-                            value_states_split = [ torch.cat((shape(value_states_split[max(0,i-1)]), value_states_ori[i]),dim=2) for i in range(len(value_states_split))]
-                        
+                        value_states_split = [ torch.cat((value_states_split[max(0,i-1)], value_states_ori[i]),dim=2) for i in range(len(value_states_split))]
+             
 
-                    attn_output = [ torch.matmul(
-                        attn_weights_split[i], value_states_split[min(len(value_states_split)-1, int(i*len(value_states_split)/len(attn_weights_split)))]
-                    ) for i in range(len(attn_weights_split))]
-                
+                attn_output = [ torch.matmul(
+                    attn_weights_split[i], value_states_split[min(len(value_states_split)-1, int(i*len(value_states_split)/len(attn_weights_split)))]
+                ) for i in range(len(attn_weights_split))]
                 attn_output = torch.stack(attn_output, dim=2)
                 attn_output = torch.squeeze(attn_output, dim=-2)
-            
             else:
-                split_idx= min(int(t*len(value_states_split)/self.gen_len), len(key_states_split)-1)
-                if t==0:
-                    self.kv_mem = torch.matmul(key_states.transpose(2,3), value_states)
+                split_idx= min(int(t*len(value_states_split)/128), len(key_states_split)-1)
                 
-                if  self.recur_select==1:#transfoxl
-                        sid= max(split_idx-1,0)
-                        value_states_split[sid], self.value_mem = self.RNN_value(unshape(value_states_split[sid]), self.value_mem)
-                  
-                if self.enable_ksvs==True:
-                    #Approximate by a complementary matrix multiplicaion
-                    if self.old_idx != split_idx: #skip if segment idx not changed
-                        ksvs = torch.matmul(key_states_split[split_idx].transpose(2,3), value_states_split[split_idx]) #bnds * bnsd= bndd
-                        self.kmvm = self.kv_mem - ksvs
-                    #end_time = time.time()
-                    #logger.info(f"ksvs time={end_time-start_time}")
-                    #start_time = time.time()
-                    #TODO: use SNN here
-                    if self.recur_select==0:
-                        #kmvm, self.kv_mem = SNN_apply(ksvs, self.kv_mem, self.SNN_kv, self.threshold, self.leak)
-                        if self.old_idx != split_idx:
-                            self.kmvm, self.snn_mem = RAF_apply(self.kmvm, self.snn_mem, self.SNN_kv, self.threshold, self.leak)
-                        
-                        #end_time = time.time()
-                        #logger.info(f"RAF time={end_time-start_time}")
-                        #start_time = time.time()
-                        attn_complement = torch.matmul(query_states, self.kmvm) #1d * dd = 1d
-                        #TODO: Test if use kv instead of kmvm
-                        #attn_complement = torch.matmul(query_states, self.kv_mem) #1d * dd = 1d
-
-                        #scale down 
-                        attn_complement = torch.div(attn_complement, torch.norm(key_states, dim=2).unsqueeze(2))
-                        #end_time = time.time()
-                        #logger.info(f"q*P time={end_time-start_time}")
-                        #start_time = time.time()
-                        #TODO TEST: divide by q*norm(k)^T; bn1d/ (bn1d*bnd1)
-                        #norm_factor = torch.matmul(query_states, torch.norm(key_states, dim=2).unsqueeze(2).transpose(2,3) ) 
-                        #attn_complement = torch.div(attn_complement, norm_factor)
-                        #attn_complement, self.snn_mem = SNN_apply(attn_complement, self.snn_mem, self.SNN_kv, self.threshold, self.leak)
-                    elif self.recur_select==1:
-                        kmvm, self.kv_mem = self.RNN_kv(self.ksvs.view(batch_size, self.n_heads, -1), self.kv_mem.view(batch_size, self.n_heads, -1))
-                        self.kv_mem = self.kv_mem.reshape(batch_size, self.n_heads, self.key_value_proj_dim,self.key_value_proj_dim)
-                        kmvm = kmvm.reshape(batch_size, self.n_heads, self.key_value_proj_dim,self.key_value_proj_dim)
+                #SNN integrate and fire or RNN
+                if self.recur_select==0 and (self.old_idx != split_idx): #SNN
+                    value_states_split[split_idx], value_mem_out = SNN_apply(unshape(value_states_split[split_idx]), self.value_mem[split_idx], self.SNN_value, self.v_threshold, self.v_leak,self.mem_gate_v)
+                elif self.recur_select==1 and (self.old_idx != split_idx):#RNN
+                    value_states_split[split_idx], value_mem_out = self.RNN_value(unshape(value_states_split[split_idx]), self.value_mem[split_idx])
+                
+                #TODO: add out key mem to attention
+                if self.parallel==True and (self.old_idx != split_idx): #end of a segment, change to the next one
+                    if t==0:
+                        self.value_mem_all =  value_mem_out
                     else:
-                        kmvm = self.kv_mem - self.ksvs
-                        attn_complement = torch.matmul(query_states, kmvm)
-                        attn_complement = torch.div(attn_complement, torch.norm(key_states, dim=2).unsqueeze(2))
+                        self.value_mem_all = torch.cat((self.value_mem_all, value_mem_out),dim=1)
+                else:
+                    self.value_mem = value_mem_out
 
-                    attn_output = torch.matmul( attn_weights, value_states_split[split_idx] ) + attn_complement
-                    #end_time = time.time()
-                    #logger.info(f"A*V time={end_time-start_time}")
-                    #TODO: test: only using complement, no ksvs
-                    #attn_output =  attn_complement
+                if self.recur_select==0 or self.recur_select==1:
+                    if self.concat_mem==True:
+                        value_states_split[split_idx]= torch.cat((shape(self.value_mem_all),shape(value_states_split[split_idx])),dim=2)
+                        #value_states_split[split_idx]= torch.cat((shape(value_states_split[split_idx]),value_states_ori[split_idx]),dim=2)
+                    else:
+                        value_states_split[split_idx]= shape(value_states_split[split_idx])+value_states_ori[split_idx]
                 else:
                     if self.concat_mem==True:
-                        if self.recur_select==0:#longt5
-                            #TODO: CONCAT global tokens for global attention
-                            value_states_cur =  torch.cat((value_states_split[split_idx], global_v),dim=2) 
-                        else: #transfoXL:
-                            value_states_cur= torch.cat((shape(value_states_split[max(0,split_idx-1)]),value_states_ori[split_idx]),dim=2)
-                    else:
-                        value_states_cur = value_states_split[split_idx] 
-                    attn_output = torch.matmul(
-                        attn_weights, value_states_cur )
+                        value_states_split[split_idx]= torch.cat((value_states_split[max(0,split_idx-1)],value_states_ori[split_idx]),dim=2)
+               
+
+                attn_output = torch.matmul(
+                    attn_weights, value_states_split[split_idx] )
                 self.old_idx = split_idx
         elif self.sparse==True: #TODO: convert to sparse matrix
             #TODO: reduce length of attention weights from bnqk to bnqs
@@ -1920,7 +1824,6 @@ class T5LayerCrossAttention(nn.Module):
         use_cache=False,
         query_length=None,
         output_attentions=False,
-        t=0,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.EncDecAttention(
@@ -1933,7 +1836,6 @@ class T5LayerCrossAttention(nn.Module):
             use_cache=use_cache,
             query_length=query_length,
             output_attentions=output_attentions,
-            t=t,
         )
         layer_output = hidden_states + self.dropout(attention_output[0])
         outputs = (layer_output,) + attention_output[1:]  # add attentions if we output them
@@ -2029,7 +1931,6 @@ class T5Block(nn.Module):
                 query_length=query_length,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                t=t,
             )
             #end_time = time.time()
             #logger.info(f"cross_attention time={end_time-start_time}")
@@ -2159,10 +2060,9 @@ class T5SpikingBlock(nn.Module):
                 query_length=query_length,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                t=t,
             )
             #end_time = time.time()
-            logger.info(f"cross_attention time={end_time-start_time}")
+            #logger.info(f"cross_attention time={end_time-start_time}")
             hidden_states = cross_attention_outputs[0]
 
             # clamp inf values to enable fp16 training
@@ -2838,7 +2738,6 @@ class T5Model(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        t=0,
     ):
         r"""
         Returns:
@@ -2910,7 +2809,6 @@ class T5Model(T5PreTrainedModel):
             cross_attn_head_mask=cross_attn_head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            t=t,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )

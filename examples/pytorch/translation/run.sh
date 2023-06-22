@@ -21,4 +21,4 @@ python examples/pytorch/translation/run_translation_no_trainer.py \
     --dataset_name wmt16 \
     --dataset_config_name ro-en \
     --output_dir ./results/translation/ \
-    --gpus=3
+    --gpus=1

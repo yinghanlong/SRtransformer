@@ -528,7 +528,7 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    logger.info(f"***Use spiking threshold. Q is not changed. Using a mem network with ONLY ONE linear layers and tanh  before proj layers for keys/values")
+    logger.info(f"***Use SRformer t5small size=16")
             
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -546,7 +546,7 @@ def main():
 
         total_steps=0
         for i in range(config.num_layers):
-            logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
+            logger.info(f"threshold={model.module.decoder.block[i].layer[1].EncDecAttention.threshold}")
         if (args.evaluation_only==False):
             model.train()
             for step, batch in enumerate(train_dataloader):
@@ -616,8 +616,8 @@ def main():
                                 #calculate average spiking rates
                 if step%eval_log_step==0:
                     for i in range(config.num_layers):
-                        print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu())
-                        avg_spiking_rate[i]+=model.module.decoder.block[i].layer[0].SelfAttention.spiking_rate.cpu()
+                        print('spiking rate of Layer ',i,model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu())
+                        avg_spiking_rate[i]+=model.module.decoder.block[i].layer[1].EncDecAttention.spiking_rate.cpu()
 
                 total_steps= step
 
@@ -628,7 +628,7 @@ def main():
         logger.info(f"average spiking rate={avg_spiking_rate}")
         #logger.info(f"average spiking rate={torch.mean(avg_spiking_rate)}")
         for i in range(config.num_layers):
-            logger.info(f"threshold={model.module.decoder.block[i].layer[0].SelfAttention.threshold}")
+            logger.info(f"threshold={model.module.decoder.block[i].layer[1].EncDecAttention.threshold}")
 
         if args.output_dir is not None:
             accelerator.wait_for_everyone()
