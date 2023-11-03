@@ -534,7 +534,7 @@ class PretrainedConfig(PushToHubMixin):
                 pretrained_model_name_or_path, filename=CONFIG_NAME, revision=revision, mirror=None
             )
         #config_file = hf_bucket_url(pretrained_model_name_or_path, filename=CONFIG_NAME, revision=revision, mirror=None)
-        logger.info("config file:",config_file)
+        #logger.info("config file:",config_file)
         try:
             # Load from URL or cache if already cached
             resolved_config_file = cached_path(

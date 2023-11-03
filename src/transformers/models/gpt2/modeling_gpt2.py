@@ -149,6 +149,8 @@ class GPT2Attention(nn.Module):
         self.is_cross_attention = is_cross_attention
 
         if self.is_cross_attention:
+            #TODO:map the size of hidden states. t5-small 512, gpt2 768
+            self.map_size = nn.Linear(512, self.embed_dim)
             self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
             self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
         else:
@@ -242,6 +244,8 @@ class GPT2Attention(nn.Module):
                 )
 
             query = self.q_attn(hidden_states)
+            #TODO: map with t5small encoder
+            encoder_hidden_states= self.map_size(encoder_hidden_states)
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
@@ -951,10 +955,10 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if use_cache:
-            print("use cache is true")
-        else:
-            #print("use cache is false")
+        #if use_cache:
+        #    print("use cache is true")
+        #else:
+        #    print("use cache is false")
             
         transformer_outputs = self.transformer(
             input_ids,

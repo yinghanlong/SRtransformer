@@ -47,6 +47,15 @@ if is_torch_available():
         "T5PreTrainedModel",
         "load_tf_weights_in_t5",
     ]
+    #import SRformer
+    _import_structure["modeling_t5_SRformer"] = [
+        #"T5_PRETRAINED_MODEL_ARCHIVE_LIST",
+        #"T5EncoderModel",
+        "T5SRformerForConditionalGeneration",
+        "T5SRformerModel",
+        #"T5PreTrainedModel",
+        #"load_tf_weights_in_t5",
+    ]
 
 if is_tf_available():
     _import_structure["modeling_tf_t5"] = [

@@ -257,7 +257,7 @@ class BartAttention(nn.Module):
 
             return out, Vmem
 
-        #TODO: add segmented attention
+        #NOTE: add segmented attention
         if self.split_crossattn==True:
             '''
             if attention_mask is not None:
@@ -368,7 +368,7 @@ class BartAttention(nn.Module):
 
         attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
-        #TODO: add segmented attention
+        #NOTE: add segmented attention
         if self.split_crossattn==True:
 
             #pad with zero
@@ -394,7 +394,7 @@ class BartAttention(nn.Module):
                     #self.kv_mem = self.kv_mem * float(1024.0/ key_states.shape[1])
                     self.kv_mem = torch.clamp(self.kv_mem , min=-2.0, max=2.0)
                     #precompute linear(ksvs), range=num of segments
-                    #TODO: multiply in parallel!
+                    #TODO: multiply in parallel
                     #key_states_s= torch.stack(key_states_split, dim=1) #m[(b*n)sd]-> (b*n)msd
                     #value_states_s= torch.stack(value_states_split, dim=1) #m[(b*n)sd]-> (b*n)msd
                     #ksvs = torch.matmul(key_states_s.transpose(-1,-2), value_states_s) #(b*n)mdd
